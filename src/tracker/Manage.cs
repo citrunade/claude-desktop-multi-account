@@ -14,8 +14,8 @@ class ManageForm : Form
     static readonly string[] PickNames = { "the most weekly limit left", "the most 5-hour limit left", "the most left on both limits" };
     static readonly int[] CapChoices = { 50, 60, 70, 80, 90, 95, 100 };
     static int CapIndex(int v) { int i = 0; for (int k = 0; k < CapChoices.Length; k++) if (CapChoices[k] <= v) i = k; return i; }
-    static readonly string[] AutoModes = { "off", "ask", "auto" };
-    static readonly string[] AutoNames = { "Do nothing", "Ask me to move it to the freest account", "Move it to the freest account by itself" };
+    static readonly string[] AutoModes = { "off", "ask", "auto", "send" };
+    static readonly string[] AutoNames = { "Do nothing", "Ask me to move it to the freest account", "Move it, I press Enter", "Move it and send it by itself" };
     static readonly KeyValuePair<int, string>[] HideChoices =
     {
         new KeyValuePair<int, string>(30, "30 minutes"), new KeyValuePair<int, string>(60, "1 hour"),

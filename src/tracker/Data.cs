@@ -707,6 +707,34 @@ static class Data
         return 0;
     }
 
+    // The main window of account n's Claude, or zero.
+    public static IntPtr AccountWindow(int n)
+    {
+        var p = Profiles().FirstOrDefault(x => x.N == n);
+        if (p == null) return IntPtr.Zero;
+        int pid = MainClaudePid(p);
+        if (pid == 0) return IntPtr.Zero;
+        IntPtr win = IntPtr.Zero;
+        EnumWindows((h, l) =>
+        {
+            uint owner; GetWindowThreadProcessId(h, out owner);
+            if (owner == pid && IsWindowVisible(h) && GetWindow(h, 4) == IntPtr.Zero) { win = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return win;
+    }
+
+    public static void Focus(IntPtr win)
+    {
+        var fg = GetForegroundWindow();
+        if (fg == win) return;
+        uint fgPid; uint fgThread = GetWindowThreadProcessId(fg, out fgPid), me = GetCurrentThreadId();
+        if (IsIconic(win)) ShowWindow(win, 9);
+        AttachThreadInput(me, fgThread, true);
+        BringWindowToTop(win); SetForegroundWindow(win);
+        AttachThreadInput(me, fgThread, false);
+    }
+
     static void BringToFront(Profile p)
     {
         for (int i = 0; i < 12; i++)

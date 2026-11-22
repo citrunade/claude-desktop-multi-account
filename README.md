@@ -26,7 +26,8 @@ Use the **gear button** on the tracker panel, or **Start menu → Claude Account
 - choose its icon and colour
 - remove one (it's closed first), keeping or deleting its sign-in
 - choose how long a conversation waiting for you stays in the tracker panel (30 minutes to 1 week; pinned ones always stay)
-- choose what happens when a conversation hits its usage limit: nothing, a notification you click to move it, or moving it by itself. Moving opens a new chat on the account with the most room left, with a summary of the conversation already typed in; press Enter there to continue.
+- choose what happens when a conversation hits its usage limit: nothing, a notification you click to move it, moving it by itself, or moving and sending it by itself. Moving opens a new chat on the account with the most room left (by weekly limit, 5-hour limit or both), with a summary of the conversation already typed in. Accounts past the weekly or 5-hour percent you choose are skipped.
+  - "Send it by itself" brings that chat to the front, holds your mouse and keyboard still for about half a second so nothing else catches the key, and presses Enter. If that window isn't in front, it doesn't send and tells you instead.
 
 ## How it works
 

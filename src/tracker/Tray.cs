@@ -63,6 +63,30 @@ static class ClaudeTray
             return;
         }
         if (args.Length > 0 && args[0] == "--unregister") { Accounts.UnregisterLimitsPlugin(); return; }
+        if (args.Length > 1 && args[0] == "--test-send")   // for checking the Enter press: a small test window should receive it
+        {
+            bool seen = false; string result = "timeout";
+            var f = new Form { Text = "Claude Tracker test", Width = 300, Height = 120, StartPosition = FormStartPosition.CenterScreen, KeyPreview = true, TopMost = false };
+            f.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) seen = true; };
+            f.Shown += (s, e) =>
+            {
+                var t = new System.Windows.Forms.Timer { Interval = 600 };
+                t.Tick += (s2, e2) =>
+                {
+                    t.Stop();
+                    AutoSend.PressEnter(f.Handle, ok =>
+                    {
+                        var t2 = new System.Windows.Forms.Timer { Interval = 200 };
+                        t2.Tick += (s3, e3) => { t2.Stop(); result = "front=" + ok + " enterReceived=" + seen; f.Close(); };
+                        t2.Start();
+                    });
+                };
+                t.Start();
+            };
+            Application.Run(f);
+            File.WriteAllText(args[1], result);
+            return;
+        }
         if (args.Length > 1 && args[0] == "--snapshot")   // for checking the accounts window: draws it to a picture, never shows it
         {
             using (var f = new ManageForm { StartPosition = FormStartPosition.Manual, Location = new Point(-5000, -5000), ShowInTaskbar = false })
@@ -225,7 +249,12 @@ static class ClaudeTray
                     Remember(sid);
                     int n = Convert.ToInt32(to["n"]);
                     string title = (string)it["title"], toName = (string)to["name"], fromName = (string)acct["name"];
-                    if (mode == "auto")
+                    if (mode == "send")
+                    {
+                        Handoff(sid, n, true, toName);
+                        tray.ShowBalloonTip(6000, "Moving to " + toName, "\"" + title + "\" hit " + fromName + "'s limit. Continuing it in a new chat on " + toName + "; your mouse and keys pause for a moment while it sends.", ToolTipIcon.Info);
+                    }
+                    else if (mode == "auto")
                     {
                         Handoff(sid, n);
                         tray.ShowBalloonTip(6000, "Moved to " + toName, "\"" + title + "\" hit " + fromName + "'s limit. It's ready in a new chat on " + toName + ": press Enter there to continue.", ToolTipIcon.Info);
@@ -323,7 +352,7 @@ static class ClaudeTray
     public static void StartAccount(int n) { Act(() => Data.StartConversation(n), "Couldn't open that account."); }
     public static void OpenConversation(string sid) { Act(() => Data.OpenConversation(sid), "Couldn't find that conversation in Claude."); }
     public static void Mark(string sid, string action) { Act(() => Marks.Set(sid, action), null); }
-    public static void Handoff(string sid, int n)
+    public static void Handoff(string sid, int n, bool send = false, string doneTitle = null)
     {
         string cwd;
         string text = null;
@@ -338,7 +367,16 @@ static class ClaudeTray
         }
         catch { }
         string folder = cwd;
-        Act(() => Data.StartConversation(n, text, folder), "Couldn't open that account.");
+        Act(() =>
+        {
+            bool ok = Data.StartConversation(n, text, folder);
+            if (ok && send)
+                AutoSend.Run(n, panel, sent =>
+                {
+                    if (!sent) tray.ShowBalloonTip(8000, "Press Enter to continue", "The new chat on " + doneTitle + " is ready, but its window wasn't in front, so it wasn't sent.", ToolTipIcon.Info);
+                });
+            return ok;
+        }, "Couldn't open that account.");
     }
 
     static ManageForm manager;
