@@ -10,6 +10,10 @@ class ManageForm : Form
 {
     static readonly string[] Kinds = { "tint", "claude", "number", "file" };
     static readonly string[] KindNames = { "Claude icon in a colour", "Claude icon, unchanged", "Number in a colour", "My own picture…" };
+    static readonly string[] PickModes = { "weekly", "five", "both" };
+    static readonly string[] PickNames = { "the most weekly limit left", "the most 5-hour limit left", "the most left on both limits" };
+    static readonly int[] CapChoices = { 50, 60, 70, 80, 90, 95, 100 };
+    static int CapIndex(int v) { int i = 0; for (int k = 0; k < CapChoices.Length; k++) if (CapChoices[k] <= v) i = k; return i; }
     static readonly string[] AutoModes = { "off", "ask", "auto" };
     static readonly string[] AutoNames = { "Do nothing", "Ask me to move it to the freest account", "Move it to the freest account by itself" };
     static readonly KeyValuePair<int, string>[] HideChoices =
@@ -37,7 +41,7 @@ class ManageForm : Form
         Font = new Font("Segoe UI", 9.5f);
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(P(620), P(600));
+        ClientSize = new Size(P(620), P(680));
 
         var title = new Label { Text = "Your Claude accounts", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(P(18), P(14)) };
         var hint = new Label
@@ -72,8 +76,30 @@ class ManageForm : Form
         });
         auto.Location = new Point(P(290), P(504));
 
+        // Which account to move it to, and which accounts are too full to take it.
+        var s0 = Accounts.Load();
+        var byLabel = new Label { Text = "Move it to the account with", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(548)) };
+        var by = MakeChoice(PickNames, Math.Max(0, Array.IndexOf(PickModes, s0.handoffPickBy ?? "both")), P(310), idx =>
+        {
+            var st = Accounts.Load(); st.handoffPickBy = PickModes[idx]; Accounts.Save(st);
+        });
+        by.Location = new Point(P(290), P(542));
+        var capLabel = new Label { Text = "Skip an account once it has used", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(586)) };
+        var pctNames = CapChoices.Select(c => c >= 100 ? "100% (until full)" : c + "%").ToArray();
+        var capWeek = MakeChoice(pctNames.Select(x => x + " weekly").ToArray(), CapIndex(s0.handoffMaxWeekly), P(150), idx =>
+        {
+            var st = Accounts.Load(); st.handoffMaxWeekly = CapChoices[idx]; Accounts.Save(st);
+        });
+        capWeek.Location = new Point(P(290), P(580));
+        var orLabel = new Label { Text = "or", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(446), P(586)) };
+        var capFive = MakeChoice(pctNames.Select(x => x + " 5-hour").ToArray(), CapIndex(s0.handoffMaxFive), P(140), idx =>
+        {
+            var st = Accounts.Load(); st.handoffMaxFive = CapChoices[idx]; Accounts.Save(st);
+        });
+        capFive.Location = new Point(P(468), P(580));
+
         addBtn = MakeButton("+ Add account", P(130));
-        addBtn.Location = new Point(P(18), P(552));
+        addBtn.Location = new Point(P(18), P(630));
         // Adding an account opens it straight away on Claude's sign-in screen.
         addBtn.Click += (s, e) =>
         {
@@ -86,8 +112,8 @@ class ManageForm : Form
                 return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
             });
         };
-        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(550)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
-        Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, addBtn, status });
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(628)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, byLabel, by, capLabel, capWeek, orLabel, capFive, addBtn, status });
         Reload();
     }
 

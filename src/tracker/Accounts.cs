@@ -34,6 +34,11 @@ public class AccountSettings
     public int hideAfterMinutes = 60;
     // When a conversation hits a usage limit: "off", "ask" (a notification to click) or "auto".
     public string autoHandoff = "ask";
+    // Which account counts as freest: "weekly", "five" (5-hour) or "both" (the fuller of the two decides).
+    public string handoffPickBy = "both";
+    // Never hand off to an account that has used this much (percent) of its weekly / 5-hour limit.
+    public int handoffMaxWeekly = 90;
+    public int handoffMaxFive = 90;
 }
 
 static class Accounts

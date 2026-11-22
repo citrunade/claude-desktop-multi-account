@@ -246,9 +246,12 @@ static class ClaudeTray
         try { File.WriteAllLines(HandedOffFile, handedOff.ToArray()); } catch { }
     }
 
-    // The account with the most room left: lowest of its 5-hour and weekly use, never one that's at its limit.
+    // The account with the most room left (by weekly, 5-hour or both, as chosen in settings),
+    // skipping any account past the chosen weekly / 5-hour ceiling.
     static Dictionary<string, object> BestAccount(Dictionary<string, object> d, int from, double now)
     {
+        var st = Accounts.Load();
+        string by = st.handoffPickBy ?? "both";
         Dictionary<string, object> best = null; double bestScore = double.MaxValue;
         foreach (Dictionary<string, object> a in Arr(d, "accounts"))
         {
@@ -256,9 +259,10 @@ static class ClaudeTray
             if (n == from || n == 99 || !(a["canStart"] is bool && (bool)a["canStart"])) continue;
             if (a["cutResetsAt"] != null && Num(a["cutResetsAt"]) > now) continue;
             double five = Pct(a, "five_hour"), week = Pct(a, "seven_day");
-            if (five >= 100 || week >= 100) continue;
+            if (five >= Math.Min(100, st.handoffMaxFive) || week >= Math.Min(100, st.handoffMaxWeekly)) continue;
             // No reading yet counts as half used: better than a busy account, worse than a known quiet one.
-            double score = Math.Max(double.IsNaN(five) ? 50 : five, double.IsNaN(week) ? 50 : week);
+            double f = double.IsNaN(five) ? 50 : five, w = double.IsNaN(week) ? 50 : week;
+            double score = by == "weekly" ? w + f / 1000 : by == "five" ? f + w / 1000 : Math.Max(f, w);
             if (score < bestScore) { bestScore = score; best = a; }
         }
         return best;
