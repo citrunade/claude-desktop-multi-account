@@ -32,6 +32,8 @@ public class AccountSettings
     public List<AccountInfo> accounts = new List<AccountInfo>();
     // How long a conversation waiting for you stays in the panel (pinned ones always stay).
     public int hideAfterMinutes = 60;
+    // When a conversation hits a usage limit: "off", "ask" (a notification to click) or "auto".
+    public string autoHandoff = "ask";
 }
 
 static class Accounts

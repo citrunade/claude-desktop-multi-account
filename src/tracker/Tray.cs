@@ -86,6 +86,7 @@ static class ClaudeTray
             SetIcon(null, false);
             tray.Visible = true;
             tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) TogglePanel(); };
+            tray.BalloonTipClicked += (s, e) => { var a = pendingHandoff; pendingHandoff = null; if (a != null) a(); };
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("Show panel", null, (s, e) => ShowPanel());
@@ -190,6 +191,77 @@ static class ClaudeTray
             lastCutReset = -1;
         }
         else if (reset > now) lastCutReset = reset;
+
+        AutoHandoff(d, now);
+    }
+
+    // ---------- hand-off when a conversation hits its limit ----------
+    static Action pendingHandoff;
+    static HashSet<string> handedOff;
+    static string HandedOffFile { get { return Path.Combine(Accounts.TrackerDir, "auto-handoffs.json"); } }
+
+    static void AutoHandoff(Dictionary<string, object> d, double now)
+    {
+        string mode = Accounts.Load().autoHandoff ?? "ask";
+        if (mode == "off") return;
+        if (handedOff == null)
+        {
+            handedOff = new HashSet<string>();
+            try { foreach (var s in File.ReadAllLines(HandedOffFile)) if (s.Trim().Length > 0) handedOff.Add(s.Trim()); } catch { }
+        }
+        foreach (Dictionary<string, object> acct in Arr(d, "accounts"))
+        {
+            int from = Convert.ToInt32(acct["n"]);
+            foreach (var cat in new[] { "cut", "unseen", "waiting", "pinned" })
+                foreach (Dictionary<string, object> it in Arr(acct, cat))
+                {
+                    if (!(it.ContainsKey("limited") && it["limited"] is bool && (bool)it["limited"])) continue;
+                    var sid = (string)it["sessionId"];
+                    if (handedOff.Contains(sid)) continue;
+                    // Only fresh ones: a limit hit more than 15 minutes ago was already seen.
+                    if (now - Num(it["lastActivity"]) > 15 * 60) { Remember(sid); continue; }
+                    var to = BestAccount(d, from, now);
+                    if (to == null) continue;   // nowhere better to go right now; try again next refresh
+                    Remember(sid);
+                    int n = Convert.ToInt32(to["n"]);
+                    string title = (string)it["title"], toName = (string)to["name"], fromName = (string)acct["name"];
+                    if (mode == "auto")
+                    {
+                        Handoff(sid, n);
+                        tray.ShowBalloonTip(6000, "Moved to " + toName, "\"" + title + "\" hit " + fromName + "'s limit. It's ready in a new chat on " + toName + ": press Enter there to continue.", ToolTipIcon.Info);
+                    }
+                    else
+                    {
+                        pendingHandoff = () => Handoff(sid, n);
+                        tray.ShowBalloonTip(15000, fromName + " hit its limit", "\"" + title + "\" stopped. Click here to continue it on " + toName + ".", ToolTipIcon.Info);
+                    }
+                    return;   // one at a time
+                }
+        }
+    }
+
+    static void Remember(string sid)
+    {
+        handedOff.Add(sid);
+        try { File.WriteAllLines(HandedOffFile, handedOff.ToArray()); } catch { }
+    }
+
+    // The account with the most room left: lowest of its 5-hour and weekly use, never one that's at its limit.
+    static Dictionary<string, object> BestAccount(Dictionary<string, object> d, int from, double now)
+    {
+        Dictionary<string, object> best = null; double bestScore = double.MaxValue;
+        foreach (Dictionary<string, object> a in Arr(d, "accounts"))
+        {
+            int n = Convert.ToInt32(a["n"]);
+            if (n == from || n == 99 || !(a["canStart"] is bool && (bool)a["canStart"])) continue;
+            if (a["cutResetsAt"] != null && Num(a["cutResetsAt"]) > now) continue;
+            double five = Pct(a, "five_hour"), week = Pct(a, "seven_day");
+            if (five >= 100 || week >= 100) continue;
+            // No reading yet counts as half used: better than a busy account, worse than a known quiet one.
+            double score = Math.Max(double.IsNaN(five) ? 50 : five, double.IsNaN(week) ? 50 : week);
+            if (score < bestScore) { bestScore = score; best = a; }
+        }
+        return best;
     }
 
     // ---------- icon ----------

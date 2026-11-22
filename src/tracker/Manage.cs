@@ -10,6 +10,8 @@ class ManageForm : Form
 {
     static readonly string[] Kinds = { "tint", "claude", "number", "file" };
     static readonly string[] KindNames = { "Claude icon in a colour", "Claude icon, unchanged", "Number in a colour", "My own picture…" };
+    static readonly string[] AutoModes = { "off", "ask", "auto" };
+    static readonly string[] AutoNames = { "Do nothing", "Ask me to move it to the freest account", "Move it to the freest account by itself" };
     static readonly KeyValuePair<int, string>[] HideChoices =
     {
         new KeyValuePair<int, string>(30, "30 minutes"), new KeyValuePair<int, string>(60, "1 hour"),
@@ -35,7 +37,7 @@ class ManageForm : Form
         Font = new Font("Segoe UI", 9.5f);
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(P(620), P(560));
+        ClientSize = new Size(P(620), P(600));
 
         var title = new Label { Text = "Your Claude accounts", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(P(18), P(14)) };
         var hint = new Label
@@ -54,28 +56,24 @@ class ManageForm : Form
         var current = Accounts.Load().hideAfterMinutes;
         int pick = 0;
         for (int i = 0; i < HideChoices.Length; i++) if (HideChoices[i].Key <= current) pick = i;
-        var hide = MakeButton(HideChoices[pick].Value + "  \u25BE", P(120));
-        hide.Location = new Point(P(290), P(466)); hide.Height = P(28);
-        var menu = new ContextMenuStrip { Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()), ShowImageMargin = false, BackColor = Ui.Card, ForeColor = Ui.Text, Font = Font };
-        for (int i = 0; i < HideChoices.Length; i++)
+        var hide = MakeChoice(HideChoices.Select(c => c.Value).ToArray(), pick, P(120), idx =>
         {
-            int idx = i;
-            var item = new ToolStripMenuItem(HideChoices[i].Value) { ForeColor = Ui.Text };
-            item.Click += (s, e) =>
-            {
-                var st = Accounts.Load();
-                st.hideAfterMinutes = HideChoices[idx].Key;
-                Accounts.Save(st);
-                hide.Text = HideChoices[idx].Value + "  \u25BE";
-                status.ForeColor = Ui.Ok; status.Text = "Saved. The panel uses it from its next refresh.";
-            };
-            menu.Items.Add(item);
-        }
-        hide.Click += (s, e) => menu.Show(hide, new Point(0, hide.Height));
+            var st = Accounts.Load(); st.hideAfterMinutes = HideChoices[idx].Key; Accounts.Save(st);
+        });
+        hide.Location = new Point(P(290), P(466));
         var pinNote = new Label { Text = "(pinned ones always stay)", ForeColor = Ui.Faint, AutoSize = true, Location = new Point(P(418), P(472)) };
 
+        // What to do when a conversation hits its usage limit.
+        var autoLabel = new Label { Text = "When a conversation hits its limit", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(510)) };
+        var mode = Accounts.Load().autoHandoff ?? "ask";
+        var auto = MakeChoice(AutoNames, Math.Max(0, Array.IndexOf(AutoModes, mode)), P(310), idx =>
+        {
+            var st = Accounts.Load(); st.autoHandoff = AutoModes[idx]; Accounts.Save(st);
+        });
+        auto.Location = new Point(P(290), P(504));
+
         addBtn = MakeButton("+ Add account", P(130));
-        addBtn.Location = new Point(P(18), P(512));
+        addBtn.Location = new Point(P(18), P(552));
         // Adding an account opens it straight away on Claude's sign-in screen.
         addBtn.Click += (s, e) =>
         {
@@ -88,12 +86,33 @@ class ManageForm : Form
                 return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
             });
         };
-        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(510)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
-        Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, addBtn, status });
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(550)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, addBtn, status });
         Reload();
     }
 
     int P(float v) { return (int)Math.Round(v * S); }
+
+    // A dark button that opens a small menu of choices; picking one saves it straight away.
+    Button MakeChoice(string[] labels, int pick, int width, Action<int> save)
+    {
+        var b = MakeButton(labels[pick] + "  \u25BE", width); b.Height = P(28);
+        var menu = new ContextMenuStrip { Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()), ShowImageMargin = false, BackColor = Ui.Card, ForeColor = Ui.Text, Font = Font };
+        for (int i = 0; i < labels.Length; i++)
+        {
+            int idx = i;
+            var item = new ToolStripMenuItem(labels[i]) { ForeColor = Ui.Text };
+            item.Click += (s, e) =>
+            {
+                save(idx);
+                b.Text = labels[idx] + "  \u25BE";
+                status.ForeColor = Ui.Ok; status.Text = "Saved. The panel uses it from its next refresh.";
+            };
+            menu.Items.Add(item);
+        }
+        b.Click += (s, e) => menu.Show(b, new Point(0, b.Height));
+        return b;
+    }
 
     Button MakeButton(string text, int width)
     {

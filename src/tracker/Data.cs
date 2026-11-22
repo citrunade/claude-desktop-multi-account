@@ -473,6 +473,7 @@ static class Data
                 { "running", alive },
                 { "detail", Or(Str(summary, "needs_action"), Str(summary, "status_detail")) },
                 { "note", note },
+                { "limited", r.A.LastKind == "limit" },
             };
             if (host != null && Str(rec, "_root") != null)
                 index[r.Sid] = new KeyValuePair<string, string>("claude://claude.ai/epitaxy/" + host, Str(rec, "_root"));
