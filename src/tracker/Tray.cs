@@ -96,6 +96,17 @@ static class ClaudeTray
             }
             return;
         }
+        if (args.Length > 2 && args[0] == "--render-panel")   // for pictures: draws the panel from saved data (JSON) to a picture
+        {
+            State = (Dictionary<string, object>)new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(File.ReadAllText(args[1]));
+            panel = new Panel { Location = new Point(-5000, -5000) };
+            if (args.Length > 4) panel.Size = new Size(int.Parse(args[3]), int.Parse(args[4]));
+            panel.Show(); Application.DoEvents();
+            // Off screen nothing paints, and the board only grows to fit while painting: paint it once to a throwaway picture.
+            for (int k = 0; k < 2; k++) using (var tmp = new Bitmap(Math.Max(1, panel.Board.Width), Math.Max(1, panel.Board.Height))) { panel.Board.DrawToBitmap(tmp, new Rectangle(0, 0, tmp.Width, tmp.Height)); Application.DoEvents(); }
+            using (var b = new Bitmap(panel.Width, panel.Height)) { panel.DrawToBitmap(b, new Rectangle(0, 0, panel.Width, panel.Height)); b.Save(args[2]); }
+            return;
+        }
         if (args.Length > 0 && args[0] == "--manage") { Application.Run(new ManageForm()); return; }
 
         bool first;
