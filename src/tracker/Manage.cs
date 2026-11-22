@@ -11,7 +11,7 @@ class ManageForm : Form
     static readonly string[] Kinds = { "tint", "claude", "number", "file" };
     static readonly string[] KindNames = { "Claude icon in a colour", "Claude icon, unchanged", "Number in a colour", "My own picture…" };
     static readonly string[] PickModes = { "weekly", "five", "both" };
-    static readonly string[] PickNames = { "the most weekly limit left", "the most 5-hour limit left", "the most left on both limits" };
+    static readonly string[] PickNames = { "the most weekly limit left for its reset", "the most 5-hour limit left", "the most left on both limits" };
     static readonly int[] CapChoices = { 50, 60, 70, 80, 90, 95, 100 };
     static int CapIndex(int v) { int i = 0; for (int k = 0; k < CapChoices.Length; k++) if (CapChoices[k] <= v) i = k; return i; }
     static readonly string[] AutoModes = { "off", "ask", "auto", "send" };
