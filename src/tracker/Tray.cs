@@ -186,6 +186,17 @@ static class ClaudeTray
         return cur;
     }
 
+    // Room counts for more when the limit resets soon: what's left is spread over the hours left and
+    // compared with an even pace over the whole period. With the whole period left, it's just the percent used.
+    // No reading counts as half used.
+    static double Paced(double used, double reset, double now, double periodHours)
+    {
+        if (double.IsNaN(used)) return 50;
+        if (double.IsNaN(reset)) return used;
+        double hoursLeft = Math.Min(periodHours, Math.Max(periodHours / 300, (reset - now) / 3600));
+        return Math.Max(0, 100 - Math.Min(100, (100 - used) * periodHours / hoursLeft));
+    }
+
     public static double ResetAt(Dictionary<string, object> acct, string kind)
     {
         if (acct == null) return double.NaN;
@@ -298,15 +309,8 @@ static class ClaudeTray
             double five = Pct(a, "five_hour"), week = Pct(a, "seven_day");
             if (five >= Math.Min(100, st.handoffMaxFive) || week >= Math.Min(100, st.handoffMaxWeekly)) continue;
             // No reading yet counts as half used: better than a busy account, worse than a known quiet one.
-            double f = double.IsNaN(five) ? 50 : five, w = double.IsNaN(week) ? 50 : week;
-            // Weekly room counts for more when the week resets soon: what's left is spread over the hours
-            // left, compared with an even pace over a full week. (A full week left: just the percent used.)
-            double wReset = ResetAt(a, "seven_day");
-            if (!double.IsNaN(week) && !double.IsNaN(wReset))
-            {
-                double hoursLeft = Math.Min(168, Math.Max(0.5, (wReset - now) / 3600));
-                w = Math.Max(0, 100 - Math.Min(100, (100 - week) * 168 / hoursLeft));
-            }
+            double f = Paced(five, ResetAt(a, "five_hour"), now, 5);
+            double w = Paced(week, ResetAt(a, "seven_day"), now, 168);
             double score = by == "weekly" ? w + f / 1000 : by == "five" ? f + w / 1000 : Math.Max(f, w);
             if (score < bestScore) { bestScore = score; best = a; }
         }
