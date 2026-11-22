@@ -1,0 +1,5 @@
+*.exe
+*.old
+*.pdb
+accounts.json
+marks.json

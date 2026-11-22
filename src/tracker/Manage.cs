@@ -1,0 +1,279 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
+using System.Threading;
+using System.Windows.Forms;
+
+// The accounts window: add an account, rename it, choose its icon, or remove it.
+class ManageForm : Form
+{
+    static readonly string[] Kinds = { "tint", "claude", "number", "file" };
+    static readonly string[] KindNames = { "Claude icon in a colour", "Claude icon, unchanged", "Number in a colour", "My own picture…" };
+    static readonly KeyValuePair<int, string>[] HideChoices =
+    {
+        new KeyValuePair<int, string>(30, "30 minutes"), new KeyValuePair<int, string>(60, "1 hour"),
+        new KeyValuePair<int, string>(180, "3 hours"), new KeyValuePair<int, string>(720, "12 hours"),
+        new KeyValuePair<int, string>(1440, "1 day"), new KeyValuePair<int, string>(4320, "3 days"),
+        new KeyValuePair<int, string>(10080, "1 week"),
+    };
+
+    readonly FlowLayoutPanel list;
+    readonly Label status;
+    readonly Button addBtn;
+    readonly float S;
+    readonly ToolTip tip = new ToolTip();
+    bool busy;
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
+
+    public ManageForm()
+    {
+        using (var g = CreateGraphics()) S = g.DpiX / 96f;
+        Text = "Claude accounts";
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        BackColor = Ui.Bg; ForeColor = Ui.Text;
+        Font = new Font("Segoe UI", 9.5f);
+        FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        ClientSize = new Size(P(620), P(560));
+
+        var title = new Label { Text = "Your Claude accounts", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(P(18), P(14)) };
+        var hint = new Label
+        {
+            Text = "Each account opens from its own shortcut and stays signed in on its own. Change a name or icon, then Save.\n" +
+                   "Account 1 is the normal Claude app: open it from its own shortcut to get your taskbar icon.",
+            ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(18), P(42)), Size = new Size(P(584), P(64))
+        };
+        list = new FlowLayoutPanel
+        {
+            Location = new Point(P(12), P(110)), Size = new Size(P(596), P(348)), AutoScroll = true,
+            FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Ui.Bg
+        };
+        // How long a conversation waiting for you stays in the panel.
+        var hideLabel = new Label { Text = "Stop showing a waiting conversation after", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(472)) };
+        var current = Accounts.Load().hideAfterMinutes;
+        int pick = 0;
+        for (int i = 0; i < HideChoices.Length; i++) if (HideChoices[i].Key <= current) pick = i;
+        var hide = MakeButton(HideChoices[pick].Value + "  \u25BE", P(120));
+        hide.Location = new Point(P(290), P(466)); hide.Height = P(28);
+        var menu = new ContextMenuStrip { Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()), ShowImageMargin = false, BackColor = Ui.Card, ForeColor = Ui.Text, Font = Font };
+        for (int i = 0; i < HideChoices.Length; i++)
+        {
+            int idx = i;
+            var item = new ToolStripMenuItem(HideChoices[i].Value) { ForeColor = Ui.Text };
+            item.Click += (s, e) =>
+            {
+                var st = Accounts.Load();
+                st.hideAfterMinutes = HideChoices[idx].Key;
+                Accounts.Save(st);
+                hide.Text = HideChoices[idx].Value + "  \u25BE";
+                status.ForeColor = Ui.Ok; status.Text = "Saved. The panel uses it from its next refresh.";
+            };
+            menu.Items.Add(item);
+        }
+        hide.Click += (s, e) => menu.Show(hide, new Point(0, hide.Height));
+        var pinNote = new Label { Text = "(pinned ones always stay)", ForeColor = Ui.Faint, AutoSize = true, Location = new Point(P(418), P(472)) };
+
+        addBtn = MakeButton("+ Add account", P(130));
+        addBtn.Location = new Point(P(18), P(512));
+        // Adding an account opens it straight away on Claude's sign-in screen.
+        addBtn.Click += (s, e) =>
+        {
+            AllowSetForegroundWindow(-1);
+            Run("Adding an account…", () =>
+            {
+                var a = Accounts.AddNew();
+                var exe = Accounts.LauncherPath(a.n);
+                if (exe != null) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false });
+                return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
+            });
+        };
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(510)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, addBtn, status });
+        Reload();
+    }
+
+    int P(float v) { return (int)Math.Round(v * S); }
+
+    Button MakeButton(string text, int width)
+    {
+        var b = new Button { Text = text, Width = width, Height = P(30), FlatStyle = FlatStyle.Flat, BackColor = Ui.Card, ForeColor = Ui.Text, Cursor = Cursors.Hand };
+        b.FlatAppearance.BorderColor = Ui.Line; b.FlatAppearance.MouseOverBackColor = Ui.Hover;
+        return b;
+    }
+
+    void Reload()
+    {
+        list.SuspendLayout();
+        foreach (Control c in list.Controls) c.Dispose();
+        list.Controls.Clear();
+        foreach (var a in Accounts.All()) list.Controls.Add(MakeRow(a));
+        list.ResumeLayout();
+    }
+
+    // Long jobs (building a launcher) run off this window's thread.
+    void Run(string doing, Func<string> work)
+    {
+        if (busy) return;
+        busy = true; UseWaitCursor = true; status.ForeColor = Ui.Dim; status.Text = doing;
+        foreach (Control c in Controls) if (c != status) c.Enabled = false;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string msg; bool ok = true;
+            try { msg = work(); } catch (Exception e) { msg = e.Message; ok = false; }
+            BeginInvoke((Action)(() =>
+            {
+                busy = false; UseWaitCursor = false;
+                foreach (Control c in Controls) c.Enabled = true;
+                status.ForeColor = ok ? Ui.Ok : Ui.Bad; status.Text = msg;
+                Reload();
+            }));
+        });
+    }
+
+    Control MakeRow(AccountInfo saved)
+    {
+        var a = new AccountInfo { n = saved.n, name = saved.name, icon = saved.icon ?? "tint", color = saved.color, file = saved.file, appId = saved.appId };
+        var row = new System.Windows.Forms.Panel { Width = P(570), Height = P(64), BackColor = Ui.Card, Margin = new Padding(P(4), P(3), P(4), P(3)) };
+
+        var pic = new PictureBox { Location = new Point(P(10), P(10)), Size = new Size(P(44), P(44)), SizeMode = PictureBoxSizeMode.Zoom };
+        var name = new TextBox
+        {
+            Location = new Point(P(66), P(8)), Width = P(150), BackColor = Ui.Bg, ForeColor = Ui.Text, BorderStyle = BorderStyle.FixedSingle,
+            Text = string.IsNullOrWhiteSpace(a.name) ? "Account " + a.n : a.name
+        };
+        var num = new Label { Text = a.n == 1 ? "Account 1 · normal Claude app" : "Account " + a.n, ForeColor = Ui.Faint, Location = new Point(P(66), P(38)), AutoSize = true, Font = new Font("Segoe UI", 8f) };
+        // Icon style: four small previews of this account's icon, click one to pick it.
+        var tiles = new List<IconTile>();
+        for (int i = 0; i < Kinds.Length; i++)
+        {
+            var t = new IconTile { Kind = Kinds[i], Location = new Point(P(228) + i * P(36), P(4)), Size = new Size(P(32), P(28)) };
+            tip.SetToolTip(t, KindNames[i]);
+            tiles.Add(t);
+        }
+        var colour = MakeButton("Colour", P(80)); colour.Location = new Point(P(228), P(34)); colour.Height = P(24);
+        var picture = MakeButton("Choose…", P(80)); picture.Location = new Point(P(312), P(34)); picture.Height = P(24);
+        var save = MakeButton("Save", P(70)); save.Location = new Point(P(410), P(8)); save.Enabled = false;
+        var remove = MakeButton("Remove", P(70)); remove.Location = new Point(P(488), P(8)); remove.Visible = a.n > 1;
+        remove.ForeColor = Ui.Bad;
+
+        Action refresh = () =>
+        {
+            var old = pic.Image; pic.Image = Accounts.Render(a, P(44)); if (old != null) old.Dispose();
+            colour.Enabled = a.icon == "tint" || a.icon == "number";
+            colour.BackColor = colour.Enabled ? Accounts.ParseColor(a.color, a.n) : Ui.Card;
+            colour.ForeColor = Color.White;
+            picture.Enabled = a.icon == "file";
+            foreach (var t in tiles)
+            {
+                var v = new AccountInfo { n = a.n, icon = t.Kind, color = a.color, file = a.file };
+                t.SetImage(t.Kind == "file" && string.IsNullOrEmpty(a.file) ? null : Accounts.Render(v, P(22)));
+                t.Selected = t.Kind == a.icon;
+            }
+        };
+        Action dirty = () => { save.Enabled = true; refresh(); };
+
+        name.TextChanged += (s, e) => { a.name = name.Text.Trim() == "Account " + a.n ? null : name.Text.Trim(); save.Enabled = true; };
+        foreach (var t in tiles)
+        {
+            var tt = t;
+            tt.Click += (s, e) =>
+            {
+                if (tt.Kind == "file" && string.IsNullOrEmpty(a.file) && !PickPicture(a)) return;
+                a.icon = tt.Kind;
+                dirty();
+            };
+        }
+        colour.Click += (s, e) =>
+        {
+            using (var cd = new ColorDialog { Color = Accounts.ParseColor(a.color, a.n), FullOpen = true, CustomColors = Accounts.Palette.Select(h => { var c = ColorTranslator.FromHtml(h); return c.R | (c.G << 8) | (c.B << 16); }).ToArray() })
+                if (cd.ShowDialog(this) == DialogResult.OK) { a.color = ColorTranslator.ToHtml(cd.Color); dirty(); }
+        };
+        picture.Click += (s, e) => { if (PickPicture(a)) dirty(); };
+        save.Click += (s, e) => Run("Saving " + Accounts.ShortcutName(a) + "…", () => { Accounts.Apply(a); return "Saved. Shortcuts and taskbar icon updated."; });
+        remove.Click += (s, e) =>
+        {
+            var r = MessageBox.Show(this,
+                "Remove " + Accounts.ShortcutName(a) + "? If it's open, it will be closed first.\n\nYes: remove its shortcuts and also sign it out (deletes its saved sign-in and settings).\n" +
+                "No: remove its shortcuts but keep the sign-in, so adding it back later finds it signed in.\nCancel: keep everything.",
+                "Remove account", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (r == DialogResult.Cancel) return;
+            bool signOut = r == DialogResult.Yes;
+            Run("Removing…", () => { Accounts.Remove(a, signOut); return Accounts.ShortcutName(a) + " removed" + (signOut ? " and signed out." : "; its sign-in is kept."); });
+        };
+
+        row.Controls.AddRange(new Control[] { pic, name, num, colour, picture, save, remove });
+        row.Controls.AddRange(tiles.ToArray());
+        refresh();
+        return row;
+    }
+
+    bool PickPicture(AccountInfo a)
+    {
+        using (var fd = new OpenFileDialog { Title = "Choose a picture for this account", Filter = "Pictures|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.ico|All files|*.*" })
+        {
+            if (fd.ShowDialog(this) != DialogResult.OK) return false;
+            // Keep a copy next to the account, so the icon survives the original being moved.
+            try
+            {
+                var dir = Accounts.AccountDir(a.n);
+                System.IO.Directory.CreateDirectory(dir);
+                var copy = System.IO.Path.Combine(dir, "picture" + System.IO.Path.GetExtension(fd.FileName).ToLowerInvariant());
+                if (!string.Equals(copy, fd.FileName, StringComparison.OrdinalIgnoreCase)) System.IO.File.Copy(fd.FileName, copy, true);
+                a.file = copy;
+            }
+            catch { a.file = fd.FileName; }
+            return true;
+        }
+    }
+}
+
+// One clickable icon preview: highlighted when it's the chosen style.
+class IconTile : Control
+{
+    public string Kind;
+    Image img;
+    bool selected, hover;
+    public bool Selected { get { return selected; } set { if (selected != value) { selected = value; Invalidate(); } } }
+
+    public IconTile()
+    {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+        Cursor = Cursors.Hand;
+        BackColor = Ui.Card;
+    }
+    public void SetImage(Image i) { var old = img; img = i; if (old != null) old.Dispose(); Invalidate(); }
+
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        var r = new RectangleF(1, 1, Width - 3, Height - 3);
+        using (var p = Accounts.Rounded(r, 6))
+        {
+            if (selected || hover) using (var b = new SolidBrush(selected ? Color.FromArgb(52, 51, 47) : Ui.Hover)) g.FillPath(b, p);
+            using (var pen = new Pen(selected ? Ui.Accent : (hover ? Color.FromArgb(70, 69, 64) : Ui.Line), selected ? 1.8f : 1f)) g.DrawPath(pen, p);
+        }
+        int s = Math.Min(Width, Height) - 8;
+        var dst = new Rectangle((Width - s) / 2, (Height - s) / 2, s, s);
+        if (img != null) g.DrawImage(img, dst);
+        else using (var f = new Font("Segoe MDL2 Assets", 10f))
+            TextRenderer.DrawText(g, "\uE8B9", f, dst, Ui.Dim, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);   // picture glyph
+    }
+}
+
+// Dark colours for the small drop-down menu in the accounts window.
+class DarkMenuColors : ProfessionalColorTable
+{
+    public override Color ToolStripDropDownBackground { get { return Ui.Card; } }
+    public override Color MenuBorder { get { return Ui.Line; } }
+    public override Color MenuItemBorder { get { return Ui.Hover; } }
+    public override Color MenuItemSelected { get { return Ui.Hover; } }
+    public override Color ImageMarginGradientBegin { get { return Ui.Card; } }
+    public override Color ImageMarginGradientMiddle { get { return Ui.Card; } }
+    public override Color ImageMarginGradientEnd { get { return Ui.Card; } }
+}

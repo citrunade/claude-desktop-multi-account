@@ -1,0 +1,7 @@
+{
+  "name": "claude-tracker",
+  "owner": { "name": "local" },
+  "plugins": [
+    { "name": "limits-beacon", "source": "./limits-beacon", "description": "Saves plan limit readings per account for the Claude Code tracker" }
+  ]
+}

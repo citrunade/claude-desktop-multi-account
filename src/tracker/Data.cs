@@ -1,0 +1,843 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
+
+// Reads Claude's own files and works out, per account: plan limits and the conversations that
+// need you (working, new, waiting, cut by a limit, pinned). Everything the panel shows comes from here.
+// Output is plain dictionaries and object[] arrays, the same shape the panel draws from.
+static class Data
+{
+    public static readonly string Home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    public static readonly string ClaudeDir = Path.Combine(Home, ".claude");
+    static readonly string SessionsDir = Path.Combine(ClaudeDir, "sessions");
+    static readonly string ProjectsDir = Path.Combine(ClaudeDir, "projects");
+    public static readonly string BySessionDir = Path.Combine(ClaudeDir, "limits-tracker", "by-session");
+    public static readonly string Local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    public static readonly string AppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+    public static readonly string ClaudeExe = Path.Combine(Local, @"Microsoft\WindowsApps\claude-desktop.exe");
+    const string SpecialOrg = "00000000-0000-4000-8000-000000000001";
+    const double ScanWindow = 8 * 86400;
+    const int TailBytes = 256 * 1024;
+    static readonly string[] Cats = { "pinned", "working", "unseen", "waiting", "cut" };
+
+    static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+
+    public static double Now() { return (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds; }
+    static double ToTs(DateTime utc) { return (utc - new DateTime(1970, 1, 1)).TotalSeconds; }
+
+    // ---------- small helpers ----------
+    public static Dictionary<string, object> ReadJson(string path)
+    {
+        try { return Json.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>; }
+        catch { return null; }
+    }
+    public static object Get(Dictionary<string, object> d, string k) { object o; return d != null && d.TryGetValue(k, out o) ? o : null; }
+    public static string Str(Dictionary<string, object> d, string k) { return Get(d, k) as string; }
+    public static Dictionary<string, object> Obj(Dictionary<string, object> d, string k) { return Get(d, k) as Dictionary<string, object>; }
+    public static double? Dbl(object o) { if (o == null || o is string || o is bool) return null; try { return Convert.ToDouble(o); } catch { return null; } }
+    static bool Truthy(object o) { return o is bool && (bool)o; }
+    static string Or(params string[] xs) { foreach (var x in xs) if (!string.IsNullOrEmpty(x)) return x; return null; }
+
+    static double? IsoToTs(object o)
+    {
+        var s = o as string;
+        if (s == null) return Dbl(o);
+        DateTime dt;
+        if (DateTime.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out dt))
+            return ToTs(dt);
+        return null;
+    }
+
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    static bool PidAlive(object pidObj)
+    {
+        var p = Dbl(pidObj);
+        if (p == null || p <= 0) return false;
+        IntPtr h = OpenProcess(0x1000, false, (int)p.Value);
+        if (h == IntPtr.Zero) return false;
+        uint code; bool ok = GetExitCodeProcess(h, out code);
+        CloseHandle(h);
+        return ok && code == 259;
+    }
+
+    static List<string> TailLines(string path, int nbytes)
+    {
+        try
+        {
+            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                long size = f.Length;
+                bool cut = size > nbytes;
+                if (cut) f.Seek(size - nbytes, SeekOrigin.Begin);
+                var buf = new byte[cut ? nbytes : size];
+                int read = 0, n;
+                while (read < buf.Length && (n = f.Read(buf, read, buf.Length - read)) > 0) read += n;
+                var text = Encoding.UTF8.GetString(buf, 0, read);
+                var lines = text.Split('\n').ToList();
+                if (cut && lines.Count > 0) lines.RemoveAt(0);  // drop partial line
+                return lines;
+            }
+        }
+        catch { return new List<string>(); }
+    }
+
+    static string ReadAllShared(string path)
+    {
+        try
+        {
+            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var r = new StreamReader(f, Encoding.UTF8)) return r.ReadToEnd();
+        }
+        catch { return null; }
+    }
+
+    static readonly Regex TitleRe = new Regex("\"customTitle\":\"((?:[^\"\\\\]|\\\\.)*)\"");
+    static readonly Regex AgentRe = new Regex("\"agentName\":\"((?:[^\"\\\\]|\\\\.)*)\"");
+    static readonly Regex OrgRe = new Regex("\"ownerOrganizationUuid\":\"([0-9a-f-]+)\"");
+
+    static string LastMatch(string text, Regex rx)
+    {
+        if (text == null) return null;
+        Match last = null;
+        foreach (Match m in rx.Matches(text)) last = m;
+        return last == null ? null : last.Groups[1].Value;
+    }
+    static string Unescape(string s) { try { return Json.Deserialize<string>("\"" + s + "\""); } catch { return s; } }
+
+    // Whole-file lookups are cached per file size + time, since most transcripts don't change between polls.
+    class FileFacts { public long Size; public DateTime Mtime; public string Title; public string Org; public bool HaveTitle, HaveOrg; public Analysis A; }
+    static readonly Dictionary<string, FileFacts> facts = new Dictionary<string, FileFacts>();
+
+    static FileFacts FactsFor(string path, FileInfo fi)
+    {
+        FileFacts f;
+        if (!facts.TryGetValue(path, out f) || f.Size != fi.Length || f.Mtime != fi.LastWriteTimeUtc)
+        {
+            f = new FileFacts { Size = fi.Length, Mtime = fi.LastWriteTimeUtc };
+            facts[path] = f;
+        }
+        return f;
+    }
+    static string TitleFromFile(string path, FileFacts f)
+    {
+        if (f.HaveTitle) return f.Title;
+        var text = ReadAllShared(path);
+        string t = LastMatch(text, TitleRe) ?? LastMatch(text, AgentRe);
+        f.Title = t == null ? null : Unescape(t); f.HaveTitle = true;
+        return f.Title;
+    }
+    static string OrgFromFile(string path, FileFacts f)
+    {
+        if (f.HaveOrg) return f.Org;
+        f.Org = LastMatch(ReadAllShared(path), OrgRe); f.HaveOrg = true;
+        return f.Org;
+    }
+
+    // ---------- accounts ----------
+    // The Store version of Claude may keep an account's data in its own private copy of AppData
+    // (%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming), which other programs can't see under
+    // the usual path. Look in both, and always name a folder by its usual path.
+    public static List<string> RoamingRoots()
+    {
+        var r = new List<string> { AppData };
+        try
+        {
+            var pk = Path.Combine(Local, "Packages");
+            if (Directory.Exists(pk))
+                foreach (var d in Directory.GetDirectories(pk, "Claude_*"))
+                {
+                    var lc = Path.Combine(d, @"LocalCache\Roaming");
+                    if (Directory.Exists(lc)) r.Add(lc);
+                }
+        }
+        catch { }
+        return r;
+    }
+    // Every real folder behind a usual-path folder name like "Claude-3".
+    public static List<string> FoldersNamed(string name)
+    {
+        return RoamingRoots().Select(r => Path.Combine(r, name)).Where(Directory.Exists).ToList();
+    }
+
+    public class Profile
+    {
+        public int N; public string Root; public string Launcher; public bool CanStart;
+        public List<string> Folders = new List<string>();   // Root plus any private copy
+    }
+
+    static List<Profile> profCache; static DateTime profAt;
+    public static List<Profile> Profiles()
+    {
+        if (profCache != null && (DateTime.UtcNow - profAt).TotalSeconds < 10) return profCache;
+        profCache = LoadProfiles(); profAt = DateTime.UtcNow;
+        return profCache;
+    }
+    static List<Profile> LoadProfiles()
+    {
+        var outp = new List<Profile>();
+        try
+        {
+            var data = Path.Combine(Local, "Claude-Data");
+            if (Directory.Exists(data))
+                foreach (var root in Directory.GetDirectories(data, "claude_*"))
+                    outp.Add(new Profile { N = 1, Root = root, Launcher = Accounts.LauncherPath(1), CanStart = File.Exists(ClaudeExe), Folders = { root } });
+        }
+        catch { }
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rr in RoamingRoots())
+            try { foreach (var d in Directory.GetDirectories(rr, "Claude-*")) names.Add(Path.GetFileName(d)); } catch { }
+        foreach (var name in names)
+        {
+            var m = Regex.Match(name, @"^Claude-(\d+)$");
+            if (!m.Success) continue;
+            int n = int.Parse(m.Groups[1].Value);
+            var exe = Accounts.LauncherPath(n);
+            outp.Add(new Profile { N = n, Root = Path.Combine(AppData, name), Launcher = exe, CanStart = exe != null, Folders = FoldersNamed(name) });
+        }
+        return outp.OrderBy(p => p.N).ToList();
+    }
+
+    static HashSet<string> ProfileOrgs(string root)
+    {
+        var orgs = new HashSet<string>();
+        try
+        {
+            var ccs = Path.Combine(root, "claude-code-sessions");
+            if (!Directory.Exists(ccs)) return orgs;
+            foreach (var d1 in Directory.GetDirectories(ccs))
+                foreach (var d2 in Directory.GetDirectories(d1))
+                {
+                    var b = Path.GetFileName(d2);
+                    if (Regex.IsMatch(b, "^[0-9a-f-]{36}$") && b != SpecialOrg) orgs.Add(b);
+                }
+        }
+        catch { }
+        return orgs;
+    }
+
+    // ---------- sessions ----------
+    static Dictionary<string, Dictionary<string, object>> LiveSessions()
+    {
+        var outp = new Dictionary<string, Dictionary<string, object>>();
+        try
+        {
+            if (!Directory.Exists(SessionsDir)) return outp;
+            foreach (var path in Directory.GetFiles(SessionsDir, "*.json"))
+            {
+                var d = ReadJson(path);
+                var sid = Str(d, "sessionId");
+                if (sid == null) continue;
+                d["alive"] = PidAlive(Get(d, "pid"));
+                Dictionary<string, object> prev;
+                if (!outp.TryGetValue(sid, out prev)
+                    || (Truthy(d["alive"]) && !Truthy(prev["alive"]))
+                    || (Dbl(Get(d, "updatedAt")) ?? 0) > (Dbl(Get(prev, "updatedAt")) ?? 0))
+                    outp[sid] = d;
+            }
+        }
+        catch { }
+        return outp;
+    }
+
+    // cli sessionId -> the desktop app's own record (title, archived, last focus, turn end, which account folder)
+    public static Dictionary<string, Dictionary<string, object>> AppRecords()
+    {
+        var roots = new List<string>();
+        try
+        {
+            var data = Path.Combine(Local, "Claude-Data");
+            if (Directory.Exists(data))
+                foreach (var d in Directory.GetDirectories(data)) roots.Add(Path.Combine(d, "claude-code-sessions"));
+        }
+        catch { }
+        var usual = new Dictionary<string, string>();   // sessions folder -> its account folder by usual path
+        foreach (var rr in RoamingRoots())
+            try
+            {
+                foreach (var d in Directory.GetDirectories(rr, "Claude*"))
+                {
+                    var ccs = Path.Combine(d, "claude-code-sessions");
+                    roots.Add(ccs);
+                    usual[ccs] = Path.Combine(AppData, Path.GetFileName(d));
+                }
+            }
+            catch { }
+
+        var outp = new Dictionary<string, Dictionary<string, object>>();
+        foreach (var root in roots)
+        {
+            if (!Directory.Exists(root)) continue;
+            try
+            {
+                foreach (var d1 in Directory.GetDirectories(root))
+                    foreach (var d2 in Directory.GetDirectories(d1))
+                        foreach (var path in Directory.GetFiles(d2, "local_*.json"))
+                        {
+                            var d = ReadJson(path);
+                            if (d == null) continue;
+                            d["_org"] = Path.GetFileName(d2);
+                            d["_root"] = usual.ContainsKey(root) ? usual[root] : Path.GetDirectoryName(root);
+                            foreach (var key in new[] { Str(d, "cliSessionId"), Str(d, "lastAssistantCliSessionId") })
+                            {
+                                if (key == null) continue;
+                                Dictionary<string, object> prev;
+                                if (!outp.TryGetValue(key, out prev) || (Dbl(Get(d, "lastActivityAt")) ?? 0) > (Dbl(Get(prev, "lastActivityAt")) ?? 0))
+                                    outp[key] = d;
+                            }
+                        }
+            }
+            catch { }
+        }
+        return outp;
+    }
+
+    class Analysis { public double? LastTs, ResetAt, Ctx; public string LastKind, LimitKind, Title, Org, Model; }
+
+    static Analysis Analyse(string path, FileFacts f)
+    {
+        if (f.A != null) return f.A;
+        var a = new Analysis();
+        var lines = TailLines(path, TailBytes);
+        for (int i = lines.Count - 1; i >= 0; i--)
+        {
+            var line = lines[i];
+            if (!line.StartsWith("{")) continue;
+            Dictionary<string, object> e;
+            try { e = Json.DeserializeObject(line) as Dictionary<string, object>; } catch { continue; }
+            if (e == null) continue;
+            string type = Str(e, "type");
+            var msg = Obj(e, "message");
+            if (a.Ctx == null && type == "assistant" && !Truthy(Get(e, "isSidechain")) && !Truthy(Get(e, "isApiErrorMessage")))
+            {
+                var u = Obj(msg, "usage");
+                double tot = (Dbl(Get(u, "input_tokens")) ?? 0) + (Dbl(Get(u, "cache_creation_input_tokens")) ?? 0) + (Dbl(Get(u, "cache_read_input_tokens")) ?? 0);
+                if (tot > 0) { a.Ctx = tot; a.Model = Str(msg, "model"); }
+            }
+            if (a.Title == null && type == "custom-title") a.Title = Str(e, "customTitle");
+            var ts = IsoToTs(Get(e, "timestamp"));
+            if (a.LastTs == null && ts != null) a.LastTs = ts;
+            if (a.LastKind == null && (type == "assistant" || type == "user") && !Truthy(Get(e, "isSidechain")))
+            {
+                if (Truthy(Get(e, "isMeta"))) continue;
+                if (type == "assistant")
+                {
+                    if (Truthy(Get(e, "isApiErrorMessage")))
+                    {
+                        var q = Obj(e, "quotaLimits");
+                        if (Str(e, "error") == "rate_limit" || Str(q, "status") == "rejected")
+                        {
+                            a.LastKind = "limit";
+                            a.ResetAt = Dbl(Get(q, "resetsAt"));
+                            a.LimitKind = Str(q, "rateLimitType") ?? "five_hour";
+                        }
+                        else a.LastKind = "error";
+                    }
+                    else a.LastKind = "assistant";
+                }
+                else
+                {
+                    var content = Get(msg, "content") as object[];
+                    bool toolResult = content != null && content.Any(c => c is Dictionary<string, object> && Str((Dictionary<string, object>)c, "type") == "tool_result");
+                    a.LastKind = toolResult ? "tool" : "user";
+                }
+            }
+            if (a.LastKind != null && a.LastTs != null && a.Title != null && a.Ctx != null) break;
+        }
+        if (a.LastKind == "limit") a.Org = OrgFromFile(path, f);
+        f.A = a;
+        return a;
+    }
+
+    class Row { public string Sid, Path; public double Mtime; public Dictionary<string, object> Info; public Analysis A; public FileFacts F; public string Org; public bool OrgDone; }
+
+    // sessionId -> (link, account folder), refreshed with every State(), so a click opens at once.
+    static Dictionary<string, KeyValuePair<string, string>> openIndex = new Dictionary<string, KeyValuePair<string, string>>();
+
+    // ---------- the whole picture ----------
+    public static Dictionary<string, object> State()
+    {
+        var index = new Dictionary<string, KeyValuePair<string, string>>();
+        double now = Now();
+        var live = LiveSessions();
+        var recs = AppRecords();
+        var profs = Profiles();
+        var marks = Marks.Load();
+        var settings = Accounts.Load();
+        double ActiveWindow = Math.Max(5, settings.hideAfterMinutes) * 60.0;
+        double scanFor = Math.Max(ScanWindow, ActiveWindow + 86400);
+
+        // org -> profile. An org seen in a dedicated app belongs to that app.
+        var owner = new Dictionary<string, Profile>();
+        foreach (var p in profs.OrderBy(p => p.N == 1).ThenBy(p => p.N))
+            foreach (var folder in p.Folders)
+                foreach (var org in ProfileOrgs(folder))
+                    if (!owner.ContainsKey(org)) owner[org] = p;
+
+        var rows = new List<Row>();
+        var seen = new HashSet<string>();
+        if (Directory.Exists(ProjectsDir))
+            foreach (var dir in SafeDirs(ProjectsDir))
+                foreach (var path in SafeFiles(dir, "*.jsonl"))
+                {
+                    FileInfo fi;
+                    try { fi = new FileInfo(path); if (!fi.Exists) continue; } catch { continue; }
+                    seen.Add(path);
+                    double mtime = ToTs(fi.LastWriteTimeUtc);
+                    string sid = System.IO.Path.GetFileNameWithoutExtension(path);
+                    Dictionary<string, object> info; live.TryGetValue(sid, out info);
+                    bool alive = info != null && Truthy(info["alive"]);
+                    if (now - mtime > scanFor && !alive && !marks.IsPinned(sid)) continue;
+                    var f = FactsFor(path, fi);
+                    rows.Add(new Row { Sid = sid, Path = path, Mtime = mtime, Info = info, F = f, A = Analyse(path, f) });
+                }
+        foreach (var k in facts.Keys.Where(k => !seen.Contains(k)).ToList()) facts.Remove(k);
+
+        Func<Row, string> orgOf = r =>
+        {
+            Dictionary<string, object> rec; recs.TryGetValue(r.Sid, out rec);
+            var ro = Str(rec, "_org");
+            if (ro != null && ro != SpecialOrg) return ro;
+            if (!r.OrgDone) { r.Org = r.A.Org ?? OrgFromFile(r.Path, r.F); r.OrgDone = true; }
+            return r.Org;
+        };
+
+        var five = rows.Where(r => r.A.LastKind == "limit" && r.A.ResetAt != null && r.A.LimitKind == "five_hour").ToList();
+        double? latestReset = five.Count > 0 ? five.Max(r => r.A.ResetAt) : null;
+        var rejections = new Dictionary<string, Dictionary<string, double>>();
+        foreach (var r in rows)
+            if (r.A.LastKind == "limit" && r.A.ResetAt != null && r.A.ResetAt > now)
+            {
+                var org = orgOf(r) ?? "unknown";
+                Dictionary<string, double> k;
+                if (!rejections.TryGetValue(org, out k)) rejections[org] = k = new Dictionary<string, double>();
+                double prev; k.TryGetValue(r.A.LimitKind, out prev);
+                k[r.A.LimitKind] = Math.Max(prev, r.A.ResetAt.Value);
+            }
+
+        var buckets = new Dictionary<string, Dictionary<string, List<Dictionary<string, object>>>>();
+        Func<Dictionary<string, List<Dictionary<string, object>>>> newBucket = () => Cats.ToDictionary(c => c, c => new List<Dictionary<string, object>>());
+        var flat = newBucket();
+
+        foreach (var r in rows)
+        {
+            var info = r.Info ?? new Dictionary<string, object>();
+            Dictionary<string, object> rec; recs.TryGetValue(r.Sid, out rec);
+            if (Truthy(Get(rec, "isArchived"))) continue;
+            bool alive = Truthy(Get(info, "alive"));
+            bool busy = alive && Str(info, "status") == "busy";
+            double last = r.A.LastTs ?? r.Mtime;
+            string cat = null;
+            if (busy) cat = "working";
+            else if (five.Contains(r) && r.A.ResetAt == latestReset) cat = "cut";
+            else if (now - last < ActiveWindow && (r.A.LastKind == "assistant" || r.A.LastKind == "error" || r.A.LastKind == "limit")) cat = "waiting";
+
+            // Finished stays hidden until the conversation gets new activity after it was finished.
+            double finished = marks.FinishedAt(r.Sid);
+            if (finished > 0 && last <= finished + 5 && cat != "working") continue;
+            string stateCat = cat;
+            if (marks.IsPinned(r.Sid)) cat = "pinned";
+            if (cat == null) continue;
+
+            var summary = Obj(rec, "postTurnSummary");
+            if (stateCat == "waiting" && rec != null && (Dbl(Get(rec, "lastFocusedAt")) ?? 0) < (Dbl(Get(rec, "lastTurnEdgeAt")) ?? 0))
+            {
+                stateCat = "unseen";
+                if (cat != "pinned") cat = "unseen";
+            }
+            string title = Or(Str(rec, "title"), Str(info, "name"), r.A.Title, TitleFromFile(r.Path, r.F)) ?? "Untitled conversation";
+            string host = Or(Str(rec, "sessionId"), Str(info, "hostSessionId"));
+            string cwd = Or(Str(rec, "cwd"), Str(info, "cwd"));
+            string note = r.A.LastKind == "error" ? "stopped on an error" : r.A.LastKind == "limit" ? (r.A.LimitKind == "seven_day" ? "hit the weekly limit" : "hit a limit") : null;
+            double since = (Dbl(Get(info, "statusUpdatedAt")) ?? 0) / 1000;
+            var item = new Dictionary<string, object>
+            {
+                { "title", title },
+                { "sessionId", r.Sid },
+                { "state", stateCat ?? "idle" },
+                { "cwd", cwd },
+                { "transcript", r.Path },
+                { "folder", string.IsNullOrEmpty(cwd) ? null : System.IO.Path.GetFileName(cwd.TrimEnd('\\', '/')) },
+                { "lastActivity", last },
+                { "since", since > 0 ? since : last },
+                { "open", host != null ? "claude://claude.ai/epitaxy/" + host : null },
+                { "ctx", r.A.Ctx },
+                { "running", alive },
+                { "detail", Or(Str(summary, "needs_action"), Str(summary, "status_detail")) },
+                { "note", note },
+            };
+            if (host != null && Str(rec, "_root") != null)
+                index[r.Sid] = new KeyValuePair<string, string>("claude://claude.ai/epitaxy/" + host, Str(rec, "_root"));
+            var o = orgOf(r) ?? "unknown";
+            Dictionary<string, List<Dictionary<string, object>>> b;
+            if (!buckets.TryGetValue(o, out b)) buckets[o] = b = newBucket();
+            b[cat].Add(item);
+            flat[cat].Add(item);
+        }
+
+        // Latest limit readings: from the limits plugin (live) and the app's own history.
+        var liveReadings = new Dictionary<string, KeyValuePair<double, object[]>>();
+        if (Directory.Exists(BySessionDir))
+            foreach (var path in SafeFiles(BySessionDir, "*.json"))
+            {
+                try { if (now - ToTs(File.GetLastWriteTimeUtc(path)) > ScanWindow) { File.Delete(path); continue; } } catch { continue; }
+                var d = ReadJson(path);
+                if (d == null) continue;
+                Dictionary<string, object> rec; recs.TryGetValue(Str(d, "sessionId") ?? "", out rec);
+                var org = Str(rec, "_org");
+                if (org == null || org == SpecialOrg) continue;
+                var atRaw = Dbl(Get(d, "at"));
+                double at = atRaw != null ? atRaw.Value / 1000 : ToTs(File.GetLastWriteTimeUtc(path));
+                if (!liveReadings.ContainsKey(org) || at > liveReadings[org].Key)
+                    liveReadings[org] = new KeyValuePair<double, object[]>(at, Get(d, "rateLimits") as object[] ?? new object[0]);
+            }
+        var samples = AppSamples(profs);
+
+        var accounts = new List<Dictionary<string, object>>();
+        var orgs = new HashSet<string>(owner.Keys.Concat(buckets.Keys).Concat(liveReadings.Keys));
+        orgs.Remove("unknown");
+        foreach (var org in orgs)
+        {
+            Profile p; owner.TryGetValue(org, out p);
+            double? asof; string source;
+            Dictionary<string, double> rej; rejections.TryGetValue(org, out rej);
+            var wins = ReadingsFor(org, liveReadings, samples, rej, now, out asof, out source);
+            Dictionary<string, List<Dictionary<string, object>>> b;
+            if (!buckets.TryGetValue(org, out b)) b = newBucket();
+            var acct = new Dictionary<string, object>
+            {
+                { "n", p != null ? p.N : 99 },
+                { "name", p != null ? Accounts.NameOf(settings, p.N) : "Account " + org.Substring(0, 8) },
+                { "org", org }, { "asOf", asof }, { "source", source }, { "windows", wins },
+                { "canStart", p != null && p.CanStart },
+                { "cutResetsAt", rej != null && rej.ContainsKey("five_hour") ? (object)rej["five_hour"] : null },
+            };
+            foreach (var c in Cats) acct[c] = b[c].OrderByDescending(x => (double)x["lastActivity"]).Cast<object>().ToArray();
+            accounts.Add(acct);
+        }
+        // Accounts set up here but with no Claude Code activity yet still get a card (and a + New button).
+        foreach (var p in profs)
+            if (!accounts.Any(a => (int)a["n"] == p.N))
+            {
+                var acct = new Dictionary<string, object>
+                {
+                    { "n", p.N }, { "name", Accounts.NameOf(settings, p.N) }, { "org", null }, { "asOf", null }, { "source", null },
+                    { "windows", new object[0] }, { "canStart", p.CanStart }, { "cutResetsAt", null },
+                };
+                foreach (var c in Cats) acct[c] = new object[0];
+                accounts.Add(acct);
+            }
+        if (buckets.ContainsKey("unknown"))
+        {
+            var acct = new Dictionary<string, object>
+            {
+                { "n", 100 }, { "name", "Other" }, { "org", null }, { "asOf", null }, { "source", null },
+                { "windows", new object[0] }, { "canStart", false }, { "cutResetsAt", null },
+            };
+            foreach (var c in Cats) acct[c] = buckets["unknown"][c].OrderByDescending(x => (double)x["lastActivity"]).Cast<object>().ToArray();
+            accounts.Add(acct);
+        }
+        accounts = accounts.OrderBy(a => (int)a["n"]).ToList();
+        var newest = accounts.Where(a => (string)a["source"] == "live").OrderByDescending(a => Dbl(a["asOf"]) ?? 0).FirstOrDefault();
+        if (newest != null) newest["current"] = true;
+
+        openIndex = index;
+        var result = new Dictionary<string, object> { { "now", now }, { "accounts", accounts.Cast<object>().ToArray() }, { "cutResetsAt", latestReset } };
+        foreach (var c in Cats) result[c] = flat[c].OrderByDescending(x => (double)x["lastActivity"]).Cast<object>().ToArray();
+        return result;
+    }
+
+    static IEnumerable<string> SafeDirs(string d) { try { return Directory.GetDirectories(d); } catch { return new string[0]; } }
+    static IEnumerable<string> SafeFiles(string d, string pat) { try { return Directory.GetFiles(d, pat); } catch { return new string[0]; } }
+
+    class Sample { public double At; public double? Five, Week; }
+    static Dictionary<string, Sample> AppSamples(List<Profile> profs)
+    {
+        var outp = new Dictionary<string, Sample>();
+        foreach (var p in profs)
+        foreach (var folder in p.Folders)
+        {
+            var d = ReadJson(Path.Combine(folder, "plan-usage-history.json"));
+            var arr = Get(d, "samples") as object[];
+            if (arr == null) continue;
+            foreach (Dictionary<string, object> s in arr.OfType<Dictionary<string, object>>())
+            {
+                var org = Str(s, "org");
+                var t = Dbl(Get(s, "t"));
+                if (org == null || t == null) continue;
+                var u = Obj(s, "u");
+                Sample prev;
+                if (!outp.TryGetValue(org, out prev) || t.Value / 1000 > prev.At)
+                    outp[org] = new Sample { At = t.Value / 1000, Five = Dbl(Get(u, "fh")), Week = Dbl(Get(u, "sd")) };
+            }
+        }
+        return outp;
+    }
+
+    static object[] ReadingsFor(string org, Dictionary<string, KeyValuePair<double, object[]>> live, Dictionary<string, Sample> samples,
+        Dictionary<string, double> rejections, double now, out double? asof, out string source)
+    {
+        asof = null; source = null;
+        var rd = new Dictionary<string, KeyValuePair<double?, double?>>();
+        if (live.ContainsKey(org))
+        {
+            asof = live[org].Key; source = "live";
+            foreach (var r in live[org].Value.OfType<Dictionary<string, object>>())
+            {
+                var kind = Str(r, "kind");
+                if (kind != null) rd[kind] = new KeyValuePair<double?, double?>(Dbl(Get(r, "percentUsed")), IsoToTs(Get(r, "resetsAt")));
+            }
+        }
+        Sample smp;
+        if (samples.TryGetValue(org, out smp) && (asof == null || smp.At > asof))
+        {
+            asof = smp.At; source = "app";
+            if (smp.Five != null) rd["five_hour"] = new KeyValuePair<double?, double?>(smp.Five, rd.ContainsKey("five_hour") ? rd["five_hour"].Value : null);
+            if (smp.Week != null) rd["seven_day"] = new KeyValuePair<double?, double?>(smp.Week, rd.ContainsKey("seven_day") ? rd["seven_day"].Value : null);
+        }
+        if (rejections != null)
+            foreach (var kv in rejections)
+            {
+                double? rs = rd.ContainsKey(kv.Key) ? rd[kv.Key].Value : null;
+                if (rs == null || kv.Value >= rs) rd[kv.Key] = new KeyValuePair<double?, double?>(100, kv.Value);
+            }
+        var wins = new List<object>();
+        foreach (var kind in new[] { "five_hour", "seven_day" })
+        {
+            string label = kind == "five_hour" ? "5-hour" : "Weekly";
+            if (!rd.ContainsKey(kind))
+            {
+                wins.Add(new Dictionary<string, object> { { "kind", kind }, { "label", label }, { "percent", null }, { "resetsAt", null } });
+                continue;
+            }
+            double? pct = rd[kind].Key, rs = rd[kind].Value;
+            if (rs != null && rs <= now) { pct = 0; rs = null; }
+            else if (rs == null && asof != null && now - asof > (kind == "five_hour" ? 5 * 3600 : 7 * 86400)) pct = null;
+            wins.Add(new Dictionary<string, object> { { "kind", kind }, { "label", label }, { "percent", pct }, { "resetsAt", rs } });
+        }
+        return wins.ToArray();
+    }
+
+    // ---------- opening things in the right account ----------
+    public static Profile ProfileForRoot(string root)
+    {
+        if (string.IsNullOrEmpty(root)) return null;
+        var want = Path.GetFullPath(root).TrimEnd('\\').ToLowerInvariant();
+        return Profiles().FirstOrDefault(p => Path.GetFullPath(p.Root).TrimEnd('\\').ToLowerInvariant() == want);
+    }
+
+    static void Run(string exe, string args)
+    {
+        try { Process.Start(new ProcessStartInfo(exe, args ?? "") { UseShellExecute = false }); } catch { }
+    }
+    static string Quote(string s) { return "\"" + s.Replace("\"", "") + "\""; }
+
+    // Bring up the account through its launcher (so its windows keep their own taskbar button) and hand the
+    // link to that account's Claude, not to whichever one Windows treats as the default.
+    public static bool OpenInAccount(Profile p, string url)
+    {
+        if (p.N == 1)
+        {
+            if (!File.Exists(ClaudeExe)) return false;
+            // The launcher opens Claude and keeps its windows on Account 1's own taskbar icon.
+            if (p.Launcher != null && !LauncherRunning(p.Launcher)) Run(p.Launcher, url != null ? Quote(url) : null);
+            else Run(ClaudeExe, url != null ? Quote(url) : null);
+        }
+        else
+        {
+            bool open = p.Launcher != null && LauncherRunning(p.Launcher);
+            if (p.Launcher != null && (!open || url == null)) Run(p.Launcher, null);
+            if (url != null && File.Exists(ClaudeExe)) Run(ClaudeExe, "--user-data-dir=" + Quote(p.Root) + " " + Quote(url));
+            if (p.Launcher == null && url == null) return false;
+        }
+        BringToFront(p);
+        return true;
+    }
+
+    static bool LauncherRunning(string exe)
+    {
+        try
+        {
+            foreach (var pr in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exe)))
+                try { if (string.Equals(pr.MainModule.FileName, exe, StringComparison.OrdinalIgnoreCase)) return true; } catch { }
+        }
+        catch { }
+        return false;
+    }
+
+    // Claude usually comes to the front by itself; if Windows kept it behind, pull it forward.
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
+    delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+
+    static int MainClaudePid(Profile p)
+    {
+        try
+        {
+            using (var q = new System.Management.ManagementObjectSearcher("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'claude.exe'"))
+                foreach (System.Management.ManagementObject o in q.Get())
+                    using (o)
+                    {
+                        var cmd = o["CommandLine"] as string ?? "";
+                        if (cmd.Contains("--type=") || cmd.Contains("--output-format")) continue;
+                        bool hasDir = cmd.IndexOf("--user-data-dir", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool mine = p.N == 1 ? !hasDir : cmd.IndexOf(p.Root, StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (mine) return Convert.ToInt32(o["ProcessId"]);
+                    }
+        }
+        catch { }
+        return 0;
+    }
+
+    static void BringToFront(Profile p)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            System.Threading.Thread.Sleep(i == 0 ? 700 : 500);
+            int pid = MainClaudePid(p);
+            if (pid == 0) continue;
+            IntPtr win = IntPtr.Zero;
+            EnumWindows((h, l) =>
+            {
+                uint owner; GetWindowThreadProcessId(h, out owner);
+                if (owner == pid && IsWindowVisible(h) && GetWindow(h, 4) == IntPtr.Zero) { win = h; return false; }
+                return true;
+            }, IntPtr.Zero);
+            if (win == IntPtr.Zero) continue;
+            var fg = GetForegroundWindow();
+            if (fg == win) return;
+            uint fgPid; uint fgThread = GetWindowThreadProcessId(fg, out fgPid), me = GetCurrentThreadId();
+            if (IsIconic(win)) ShowWindow(win, 9);
+            AttachThreadInput(me, fgThread, true);
+            BringWindowToTop(win); SetForegroundWindow(win);
+            AttachThreadInput(me, fgThread, false);
+            return;
+        }
+    }
+
+    public static bool OpenConversation(string sid)
+    {
+        KeyValuePair<string, string> known;
+        if (openIndex.TryGetValue(sid, out known))
+        {
+            var kp = ProfileForRoot(known.Value);
+            if (kp != null) return OpenInAccount(kp, known.Key);
+        }
+        Dictionary<string, object> rec;
+        if (!AppRecords().TryGetValue(sid, out rec)) return false;
+        var host = Str(rec, "sessionId");
+        var p = ProfileForRoot(Str(rec, "_root"));
+        if (host == null || p == null) return false;
+        return OpenInAccount(p, "claude://claude.ai/epitaxy/" + host);
+    }
+
+    public static bool StartConversation(int n, string prompt = null, string folder = null)
+    {
+        var p = Profiles().FirstOrDefault(x => x.N == n && x.CanStart);
+        if (p == null) return false;
+        var q = new List<string>();
+        if (!string.IsNullOrEmpty(prompt)) q.Add("q=" + Uri.EscapeDataString(prompt));
+        if (!string.IsNullOrEmpty(folder) && Directory.Exists(folder)) q.Add("folder=" + Uri.EscapeDataString(folder));
+        return OpenInAccount(p, "claude://code/new" + (q.Count > 0 ? "?" + string.Join("&", q) : ""));
+    }
+
+    // ---------- hand off ----------
+    static readonly Regex NoteTags = new Regex(@"<(system-reminder|local-command[a-z-]*|command-[a-z-]+)>.*?</\1>", RegexOptions.Singleline);
+
+    public static string HandoffText(string sid, out string cwd)
+    {
+        cwd = null;
+        string path = null;
+        foreach (var dir in SafeDirs(ProjectsDir))
+        {
+            var cand = Path.Combine(dir, sid + ".jsonl");
+            if (File.Exists(cand)) { path = cand; break; }
+        }
+        if (path == null) return null;
+        Dictionary<string, object> rec; AppRecords().TryGetValue(sid, out rec);
+        Dictionary<string, object> info; LiveSessions().TryGetValue(sid, out info);
+        var fi = new FileInfo(path);
+        var f = FactsFor(path, fi);
+        var a = Analyse(path, f);
+        string title = Or(Str(rec, "title"), Str(info, "name"), a.Title, TitleFromFile(path, f)) ?? "Untitled conversation";
+        cwd = Or(Str(rec, "cwd"), Str(info, "cwd")) ?? "";
+
+        // The last few things said, so the new chat sees where it stopped without opening the file.
+        var said = new List<KeyValuePair<string, string>>();
+        var lines = TailLines(path, 512 * 1024);
+        for (int i = lines.Count - 1; i >= 0 && said.Count < 5; i--)
+        {
+            if (!lines[i].StartsWith("{")) continue;
+            Dictionary<string, object> e;
+            try { e = Json.DeserializeObject(lines[i]) as Dictionary<string, object>; } catch { continue; }
+            var type = Str(e, "type");
+            if ((type != "user" && type != "assistant") || Truthy(Get(e, "isSidechain")) || Truthy(Get(e, "isMeta"))) continue;
+            var content = Get(Obj(e, "message"), "content");
+            string text = content as string;
+            if (content is object[])
+                text = string.Join("\n", ((object[])content).OfType<Dictionary<string, object>>().Where(c => Str(c, "type") == "text").Select(c => Str(c, "text")));
+            text = NoteTags.Replace(text ?? "", "").Trim();
+            if (text.Length == 0 || text.StartsWith("<")) continue;
+            string who = type == "user" ? "Me" : "Claude";
+            if (said.Count(s => s.Key == who) >= (who == "Me" ? 2 : 3)) continue;
+            said.Add(new KeyValuePair<string, string>(who, who + ": " + (text.Length > 1200 ? text.Substring(0, 1200) + " [...]" : text)));
+        }
+        said.Reverse();
+        var sb = new StringBuilder();
+        sb.Append("I'm moving a conversation over from another of my Claude accounts. Please pick it up where it left off.\n\n");
+        sb.Append("Conversation: " + title + "\n");
+        if (cwd.Length > 0) sb.Append("Folder it was working in: " + cwd + "\n");
+        sb.Append("Full transcript (one JSON message per line, newest at the bottom): " + path + "\n\n");
+        sb.Append("Read the end of the transcript first (the last few hundred lines are usually enough) to see what was asked, what was done, and what is still open. Then tell me in a few lines where things stand and carry on.\n\n");
+        sb.Append("The last messages were:\n\n" + string.Join("\n\n", said.Select(s => s.Value)));
+        return sb.ToString();
+    }
+}
+
+// Pinned and finished conversations, kept next to the program.
+class Marks
+{
+    static readonly string File_ = Path.Combine(Accounts.TrackerDir, "marks.json");
+    static readonly object Lock = new object();
+    readonly Dictionary<string, object> d;
+    Marks(Dictionary<string, object> d) { this.d = d ?? new Dictionary<string, object>(); }
+    public static Marks Load() { return new Marks(Data.ReadJson(File_)); }
+
+    public bool IsPinned(string sid) { return Data.Get(Data.Obj(d, sid), "pinned") != null; }
+    public double FinishedAt(string sid) { return Data.Dbl(Data.Get(Data.Obj(d, sid), "finished")) ?? 0; }
+
+    public static bool Set(string sid, string action)
+    {
+        lock (Lock)
+        {
+            var m = Data.ReadJson(File_) ?? new Dictionary<string, object>();
+            double now = Data.Now();
+            if (action == "pin") m[sid] = new Dictionary<string, object> { { "pinned", now } };          // pinning also clears "finished"
+            else if (action == "finish") m[sid] = new Dictionary<string, object> { { "finished", now } }; // finishing always unpins
+            else if (action == "unpin" || action == "unfinish") m.Remove(sid);
+            else return false;
+            Directory.CreateDirectory(Path.GetDirectoryName(File_));
+            var tmp = File_ + ".tmp";
+            File.WriteAllText(tmp, new JavaScriptSerializer().Serialize(m));
+            if (File.Exists(File_)) File.Replace(tmp, File_, null); else File.Move(tmp, File_);
+            return true;
+        }
+    }
+}

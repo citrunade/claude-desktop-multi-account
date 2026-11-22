@@ -1,0 +1,1 @@
+{ "name": "limits-beacon", "version": "0.3.0", "description": "Saves the plan limit numbers each Claude reply carries, per account, for the Claude Code tracker. Makes no model calls." }
