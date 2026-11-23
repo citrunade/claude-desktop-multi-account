@@ -43,22 +43,21 @@ class BarWindow : Form
         base.OnHandleCreated(e);
         int round = 3;   // small rounded corners
         try { DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { }
-        Own();
     }
 
-    // The bar belongs to the taskbar window, so whenever the taskbar comes to the front (you clicked
-    // it to switch windows) Windows brings the bar along in the same step: it never shows behind it,
-    // not even for a moment. It also drops behind a full-screen app together with the taskbar.
+    // Whether the taskbar is in front of the bar right now (you clicked it). Don't make the bar
+    // belong to the taskbar instead: that ties it to Explorer's input and dragging it then hangs.
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
-    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
-    const int GWLP_HWNDPARENT = -8;
-    public void Own()
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    public bool TaskbarInFront()
     {
-        if (!IsHandleCreated) return;
-        var tb = FindWindow("Shell_TrayWnd", null);   // a new one after Explorer restarts
-        if (tb != IntPtr.Zero && GetWindowLongPtr(Handle, GWLP_HWNDPARENT) != tb)
-            SetWindowLongPtr(Handle, GWLP_HWNDPARENT, tb);
+        if (!IsHandleCreated) return false;
+        var tb = FindWindow("Shell_TrayWnd", null);
+        if (tb == IntPtr.Zero) return false;
+        int n = 0;
+        for (var h = GetWindow(Handle, 3 /* GW_HWNDPREV: the window just above */); h != IntPtr.Zero && n < 400; h = GetWindow(h, 3), n++)
+            if (h == tb) return true;
+        return false;
     }
 
     protected override void OnPaint(PaintEventArgs e)

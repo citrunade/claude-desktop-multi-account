@@ -905,19 +905,13 @@ class Panel : Form
     int pillTicks; IntPtr pillFg;
     void KeepPillOnTaskbar()
     {
-        if (bar != null && bar.IsDisposed && Visible)
-        {
-            // Explorer restarting can take the bar down with the taskbar it belongs to: make a new one.
-            bar = new BarWindow(this);
-            bar.Bounds = PillRect(); bar.Show();
-        }
-        if (bar == null || bar.IsDisposed || !bar.Visible || dragging) return;
-        if (pillTicks % 8 == 0) bar.Own();
+        if (bar == null || !bar.Visible || dragging) return;
         // Clicking the taskbar (to switch Claude windows) puts it over the bar: lift the bar back the
-        // moment the front window changes, not up to a third of a second later, so it doesn't blink.
+        // moment the front window changes or the taskbar is seen in front of it (checked every 40 ms),
+        // not up to a third of a second later, so it doesn't blink.
         var fg = GetForegroundWindow(); RECT fr;
         bool changed = fg != pillFg; pillFg = fg;
-        if (++pillTicks % 8 != 0 && !changed) return;
+        if (++pillTicks % 8 != 0 && !changed && !bar.TaskbarInFront()) return;
         var sb = Screen.PrimaryScreen.Bounds;
         if (fg != IntPtr.Zero && fg != Handle && GetWindowRect(fg, out fr) && fr.L <= sb.Left && fr.T <= sb.Top && fr.R >= sb.Right && fr.B >= sb.Bottom) return;
         var pr = PillRect();
@@ -930,9 +924,12 @@ class Panel : Form
     {
         var start = bar.Location;
         dragging = true;
-        ReleaseCapture();
-        SendMessage(bar.Handle, 0xA1, (IntPtr)2, IntPtr.Zero);   // drag like a title bar (returns when let go)
-        dragging = false;
+        try
+        {
+            ReleaseCapture();
+            SendMessage(bar.Handle, 0xA1, (IntPtr)2, IntPtr.Zero);   // drag like a title bar (returns when let go)
+        }
+        finally { dragging = false; }   // stuck "dragging" would freeze the panel shut
         if (bar.Location == start)
         {
             if (!hoverMode) ClickToggle(!targetCollapsed);
