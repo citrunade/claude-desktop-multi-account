@@ -45,6 +45,11 @@ public class AccountSettings
     public bool panelElsewhereShrunk = false;
     // Send each account a one-line message when its 5-hour window isn't running, so the clock starts.
     public bool keepClock = false;
+    // With keepClock: also send while you're using the PC (input pauses for a moment, like a hand-off).
+    public bool keepClockAnytime = false;
+    // Keep conversations cut by a limit in the panel until they are handed off (or finished / continued),
+    // instead of letting them drop out after hideAfterMinutes or when another chat hits a newer limit.
+    public bool keepCut = false;
     // When a conversation hits a usage limit: "off", "ask" (a notification to click) or "auto".
     public string autoHandoff = "ask";
     // Which account counts as freest: "weekly", "five" (5-hour) or "both" (the fuller of the two decides).

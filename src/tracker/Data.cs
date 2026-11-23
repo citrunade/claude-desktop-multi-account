@@ -44,6 +44,23 @@ static class Data
     static bool Truthy(object o) { return o is bool && (bool)o; }
     static string Or(params string[] xs) { foreach (var x in xs) if (!string.IsNullOrEmpty(x)) return x; return null; }
 
+    // Conversations continued in a new chat (by hand or automatically). Only these count as handed off.
+    static string HandedOffFile { get { return Path.Combine(Accounts.TrackerDir, "handed-off.txt"); } }
+    static readonly object handedOffLock = new object();
+    public static void MarkHandedOff(string sid)
+    {
+        lock (handedOffLock) try { File.AppendAllText(HandedOffFile, sid + Environment.NewLine); } catch { }
+    }
+    static HashSet<string> HandedOff()
+    {
+        var outp = new HashSet<string>();
+        lock (handedOffLock)
+            try { foreach (var s in File.ReadAllLines(HandedOffFile)) if (s.Trim().Length > 0) outp.Add(s.Trim()); } catch { }
+        // Every hand-off also leaves its text in handoffs\<id>.md, including ones from before this list existed.
+        try { foreach (var p in SafeFiles(Path.Combine(ClaudeDir, "handoffs"), "*.md")) outp.Add(Path.GetFileNameWithoutExtension(p)); } catch { }
+        return outp;
+    }
+
     static double? IsoToTs(object o)
     {
         var s = o as string;
@@ -710,6 +727,7 @@ static class Data
         var buckets = new Dictionary<string, Dictionary<string, List<Dictionary<string, object>>>>();
         Func<Dictionary<string, List<Dictionary<string, object>>>> newBucket = () => Cats.ToDictionary(c => c, c => new List<Dictionary<string, object>>());
         var flat = newBucket();
+        var handedOff = settings.keepCut ? HandedOff() : new HashSet<string>();
 
         foreach (var r in rows)
         {
@@ -723,6 +741,7 @@ static class Data
             string cat = null;
             if (busy || background) cat = "working";
             else if (five.Contains(r) && r.A.ResetAt == latestReset) cat = "cut";
+            else if (settings.keepCut && r.A.LastKind == "limit" && !handedOff.Contains(r.Sid)) cat = "cut";
             else if (now - last < ActiveWindow && (r.A.LastKind == "assistant" || r.A.LastKind == "error" || r.A.LastKind == "limit")) cat = "waiting";
 
             // Finished stays hidden until the conversation gets new activity after it was finished.

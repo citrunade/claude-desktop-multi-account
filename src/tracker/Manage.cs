@@ -69,7 +69,7 @@ class ManageForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;   // always above the panel, which is itself always on top
-        ClientSize = new Size(P(620), P(802));
+        ClientSize = new Size(P(620), P(840));
 
         var title = new Label { Text = "Your Claude accounts", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(P(18), P(14)) };
         var hint = new Label
@@ -141,16 +141,25 @@ class ManageForm : Form
         });
         outside.Location = new Point(P(270), P(662));
         var clockLabel = new Label { Text = "Start each account's 5-hour clock", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(706)) };
-        var clock = MakeChoice(new[] { "Off", "Automatically, while I'm away from the PC" }, s0.keepClock ? 1 : 0, P(330), idx =>
+        var clock = MakeChoice(new[] { "Off", "Automatically, while I'm away from the PC", "Automatically, even while I'm using the PC" },
+            !s0.keepClock ? 0 : s0.keepClockAnytime ? 2 : 1, P(330), idx =>
         {
-            var st = Accounts.Load(); st.keepClock = idx == 1; Accounts.Save(st);
+            var st = Accounts.Load(); st.keepClock = idx > 0; st.keepClockAnytime = idx == 2; Accounts.Save(st);
         });
         clock.Location = new Point(P(270), P(700));
-        tip.SetToolTip(clock, "When an account's 5-hour limit isn't counting down, it gets a one-line message in a new chat so the\n5 hours start now. This opens that chat and presses Enter, so it only happens after 2 minutes without\nmouse or keyboard use. These chats don't show in the panel.");
-        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock });
+        tip.SetToolTip(clock, "When an account's 5-hour limit isn't counting down, it gets a one-line message in a new chat so the\n5 hours start now. This opens that chat and presses Enter. \"Away\" waits for 2 minutes without mouse or\nkeyboard use; \"even while using\" sends right away, pausing your mouse and keys for a moment. These chats\ndon't show in the panel.");
+        var cutLabel = new Label { Text = "Chats cut by a limit", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(744)) };
+        var keepCut = MakeChoice(new[] { "Hide like other chats", "Keep until handed off" }, s0.keepCut ? 1 : 0, P(330), idx =>
+        {
+            var st = Accounts.Load(); st.keepCut = idx == 1; Accounts.Save(st);
+            ClaudeTray.Fetch();
+        });
+        keepCut.Location = new Point(P(270), P(738));
+        tip.SetToolTip(keepCut, "Keep every conversation that hit a limit and wasn't continued in a new chat on another account,\nunder \"Cut\", however long ago it stopped. It leaves once you hand it off, mark it finished, or carry on in it.");
+        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, cutLabel, keepCut });
 
         addBtn = MakeButton("+ Add account", P(130));
-        addBtn.Location = new Point(P(18), P(752));
+        addBtn.Location = new Point(P(18), P(790));
         // Adding an account opens it straight away on Claude's sign-in screen.
         addBtn.Click += (s, e) =>
         {
@@ -163,7 +172,7 @@ class ManageForm : Form
                 return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
             });
         };
-        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(750)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(788)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
         Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, byLabel, by, capLabel, capWeek, orLabel, capFive, addBtn, status });
         Reload();
     }

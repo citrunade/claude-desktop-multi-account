@@ -281,9 +281,26 @@ static class ClaudeTray
         return unchecked((uint)Environment.TickCount - li.dwTime) / 1000.0;
     }
 
+    // One line in clock.log each time the reason for (not) starting an account's clock changes.
+    static readonly Dictionary<string, string> clockWhy = new Dictionary<string, string>();
+    static void ClockNote(string key, string why)
+    {
+        lock (clockWhy)
+        {
+            string prev;
+            if (clockWhy.TryGetValue(key, out prev) && prev == why) return;
+            clockWhy[key] = why;
+        }
+        try { File.AppendAllText(Path.Combine(Accounts.TrackerDir, "clock.log"), DateTime.Now.ToString("MM-dd HH:mm:ss") + " " + key + ": " + why + Environment.NewLine); } catch { }
+    }
+
     static void KeepClock(Dictionary<string, object> d, double now)
     {
-        if (clockBusy || !Accounts.Load().keepClock || IdleSeconds() < 120) return;
+        var cs = Accounts.Load();
+        if (!cs.keepClock) { ClockNote("all", "setting is off"); return; }
+        ClockNote("all", cs.keepClockAnytime ? "on, even while you're using the PC" : "on, only while you're away");
+        if (clockBusy) return;
+        bool away = cs.keepClockAnytime || IdleSeconds() >= 120;
         if (clockStarts == null)
         {
             clockStarts = new Dictionary<string, double>();
@@ -293,13 +310,17 @@ static class ClaudeTray
         foreach (Dictionary<string, object> a in Arr(d, "accounts"))
         {
             int n = Convert.ToInt32(a["n"]);
-            if (n >= 99 || !(a["canStart"] is bool && (bool)a["canStart"])) continue;
+            if (n >= 99) continue;
+            string key = "account " + n;
+            if (!(a["canStart"] is bool && (bool)a["canStart"])) { ClockNote(key, "can't open a chat in it"); continue; }
             double reset = ResetAt(a, "five_hour"), pct = Pct(a, "five_hour");
             double asOf = a["asOf"] == null ? double.NaN : Num(a["asOf"]);
-            if (!double.IsNaN(reset) && reset > now) continue;                               // its window is running
-            if (double.IsNaN(reset) && !double.IsNaN(pct) && pct > 0 && now - asOf < 5 * 3600) continue;   // used lately, reset time unknown
+            if (!double.IsNaN(reset) && reset > now) { ClockNote(key, "window running"); continue; }
+            if (double.IsNaN(reset) && !double.IsNaN(pct) && pct > 0 && now - asOf < 5 * 3600) { ClockNote(key, "used lately (" + Math.Round(pct) + "%), reset time unknown"); continue; }
             double last; clockStarts.TryGetValue(n.ToString(), out last);
-            if (now - last < 5 * 3600) continue;                                                // we started it under 5 hours ago
+            if (now - last < 5 * 3600) { ClockNote(key, "started or tried under 5 hours ago"); continue; }
+            if (!away) { ClockNote(key, "window not running; waiting for 2 minutes without mouse or keyboard"); continue; }
+            ClockNote(key, "starting its clock");
             clockStarts[n.ToString()] = now;
             try { File.WriteAllText(ClockFile, new JavaScriptSerializer().Serialize(clockStarts)); } catch { }
             clockBusy = true;
@@ -308,10 +329,11 @@ static class ClaudeTray
             {
                 bool opened = false;
                 try { opened = Data.StartConversation(nn, KeepClockText); } catch { }
-                if (!opened) { clockBusy = false; return; }
+                if (!opened) { clockBusy = false; ClockNote("account " + nn, "couldn't open a new chat"); return; }
                 AutoSend.Run(nn, panel, sent =>
                 {
                     clockBusy = false;
+                    ClockNote("account " + nn, sent ? "sent" : "not sent: its window wasn't in front; retrying in 15 minutes");
                     // Not sent (its window wasn't in front): try again in 15 minutes rather than in 5 hours.
                     if (!sent) clockStarts[nn.ToString()] = Data.Now() - 5 * 3600 + 15 * 60;
                     else tray.ShowBalloonTip(4000, "Started " + name + "'s 5-hour clock", "Sent a one-line message so its 5-hour limit resets 5 hours from now.", ToolTipIcon.Info);
@@ -479,6 +501,7 @@ static class ClaudeTray
         Act(() =>
         {
             bool ok = Data.StartConversation(n, text, folder);
+            if (ok) Data.MarkHandedOff(sid);
             if (ok && askTrust)
                 try { panel.BeginInvoke((Action)(() => tray.ShowBalloonTip(8000, "Check the new chat", "Claude is asking whether to trust " + folder + ". Answer it, then press Enter to send the hand-off.", ToolTipIcon.Info))); } catch { }
             if (ok && send)
@@ -1484,7 +1507,7 @@ class Board : DoubleBufferedControl
 
     static readonly string[][] Groups = {
         new[] { "pinned", "PINNED" }, new[] { "working", "WORKING" }, new[] { "unseen", "NEW, NOT SEEN" },
-        new[] { "waiting", "SEEN, WAITING FOR YOU" }, new[] { "cut", "CUT BY 5-HOUR LIMIT" } };
+        new[] { "waiting", "SEEN, WAITING FOR YOU" }, new[] { "cut", "CUT BY A LIMIT" } };
 
     protected override void OnPaint(PaintEventArgs e)
     {
