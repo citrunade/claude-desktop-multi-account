@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -139,6 +139,10 @@ static class ClaudeTray
             var sig = new System.Windows.Forms.Timer { Interval = 250 };
             sig.Tick += (s, e) => { if (showSignal.WaitOne(0)) ShowPanel(); };
             sig.Start();
+            var auto = new System.Windows.Forms.Timer { Interval = 40 };
+            auto.Tick += (s, e) => panel.AutoTick();
+            auto.Start();
+            panel.WatchForeground();
             var tick = new System.Windows.Forms.Timer { Interval = 1000 };
             tick.Tick += (s, e) => { if (panel.Visible) panel.Invalidate(true); };
             tick.Start();
@@ -224,11 +228,14 @@ static class ClaudeTray
         return double.NaN;
     }
 
+    static int lastUnseen = -1;
     static void Apply(Dictionary<string, object> d)
     {
         var cur = Current();
         double five = Pct(cur, "five_hour"), week = Pct(cur, "seven_day");
         int unseen = Arr(d, "unseen").Length, waiting = Arr(d, "waiting").Length;
+        if (unseen > lastUnseen && lastUnseen >= 0) panel.FlashNew();   // a new answer came in
+        lastUnseen = unseen;
         int working = Arr(d, "working").Length, cut = Arr(d, "cut").Length;
         SetIcon(double.IsNaN(five) ? (double?)null : five, unseen > 0);
         string tip = (double.IsNaN(five) ? "5h ?" : "5h " + Math.Round(five) + "%")
@@ -247,6 +254,67 @@ static class ClaudeTray
         else if (reset > now) lastCutReset = reset;
 
         AutoHandoff(d, now);
+        KeepClock(d, now);
+    }
+
+    // ---------- starting each account's 5-hour clock ----------
+    // The 5-hour limit's clock only starts with an account's first message. When an account's window
+    // isn't running, send it a one-line message so the clock starts now and resets 5 hours from now,
+    // instead of starting whenever you next happen to use it. Sending means opening a new chat in that
+    // account and pressing Enter in it, so it only happens while you're away from the keyboard and mouse.
+    public const string KeepClockMarker = "[Claude Tracker: 5-hour clock start]";
+    const string KeepClockText = "Hi! " + KeepClockMarker + " Reply with just OK.";
+    static Dictionary<string, double> clockStarts;
+    static bool clockBusy;
+    static string ClockFile { get { return Path.Combine(Accounts.TrackerDir, "clock-starts.json"); } }
+
+    [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+    static double IdleSeconds()
+    {
+        var li = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO)) };
+        if (!GetLastInputInfo(ref li)) return 0;
+        return unchecked((uint)Environment.TickCount - li.dwTime) / 1000.0;
+    }
+
+    static void KeepClock(Dictionary<string, object> d, double now)
+    {
+        if (clockBusy || !Accounts.Load().keepClock || IdleSeconds() < 120) return;
+        if (clockStarts == null)
+        {
+            clockStarts = new Dictionary<string, double>();
+            var saved = Data.ReadJson(ClockFile);
+            if (saved != null) foreach (var kv in saved) { var v = Data.Dbl(kv.Value); if (v != null) clockStarts[kv.Key] = v.Value; }
+        }
+        foreach (Dictionary<string, object> a in Arr(d, "accounts"))
+        {
+            int n = Convert.ToInt32(a["n"]);
+            if (n >= 99 || !(a["canStart"] is bool && (bool)a["canStart"])) continue;
+            double reset = ResetAt(a, "five_hour"), pct = Pct(a, "five_hour");
+            double asOf = a["asOf"] == null ? double.NaN : Num(a["asOf"]);
+            if (!double.IsNaN(reset) && reset > now) continue;                               // its window is running
+            if (double.IsNaN(reset) && !double.IsNaN(pct) && pct > 0 && now - asOf < 5 * 3600) continue;   // used lately, reset time unknown
+            double last; clockStarts.TryGetValue(n.ToString(), out last);
+            if (now - last < 5 * 3600) continue;                                                // we started it under 5 hours ago
+            clockStarts[n.ToString()] = now;
+            try { File.WriteAllText(ClockFile, new JavaScriptSerializer().Serialize(clockStarts)); } catch { }
+            clockBusy = true;
+            string name = (string)a["name"]; int nn = n;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool opened = false;
+                try { opened = Data.StartConversation(nn, KeepClockText); } catch { }
+                if (!opened) { clockBusy = false; return; }
+                AutoSend.Run(nn, panel, sent =>
+                {
+                    clockBusy = false;
+                    // Not sent (its window wasn't in front): try again in 15 minutes rather than in 5 hours.
+                    if (!sent) clockStarts[nn.ToString()] = Data.Now() - 5 * 3600 + 15 * 60;
+                    else tray.ShowBalloonTip(4000, "Started " + name + "'s 5-hour clock", "Sent a one-line message so its 5-hour limit resets 5 hours from now.", ToolTipIcon.Info);
+                });
+            });
+            return;   // one account per refresh
+        }
     }
 
     // ---------- hand-off when a conversation hits its limit ----------
@@ -418,7 +486,13 @@ static class ClaudeTray
             manager = new ManageForm();
             manager.FormClosed += (s, e) => Fetch();
         }
-        manager.Show(); manager.Activate();
+        // Open in the middle of the screen the panel is on, above it.
+        var wa = Screen.FromControl(panel != null ? (Control)panel : manager).WorkingArea;
+        manager.StartPosition = FormStartPosition.Manual;
+        if (manager.WindowState == FormWindowState.Minimized) manager.WindowState = FormWindowState.Normal;
+        manager.Location = new Point(wa.Left + Math.Max(0, (wa.Width - manager.Width) / 2), wa.Top + Math.Max(0, (wa.Height - manager.Height) / 2));
+        manager.TopMost = true;
+        manager.Show(); manager.BringToFront(); manager.Activate();
     }
 
     public static void Open(string link)
@@ -490,7 +564,8 @@ class Panel : Form
 
     public readonly float S;
     public readonly Board Board;
-    readonly Control header;
+    readonly Control header, footer;
+    Rectangle btnModeClaude, btnModeElse;
     readonly ScrollHost host;
     bool collapsed;
     Size expandedSize;
@@ -507,10 +582,11 @@ class Panel : Form
         StartPosition = FormStartPosition.Manual;
         BackColor = Ui.Bg;
         DoubleBuffered = true;
+        AllowTransparency = true; Opacity = 0.999;   // fadeable from the start (see Rest)
         Text = "Claude Tracker";
         expandedSize = new Size(P(380), P(620));
         Size = expandedSize;
-        Padding = new Padding(1);
+        Padding = new Padding(P(4));   // a thin edge to grab for resizing
 
         header = new DoubleBufferedControl { Dock = DockStyle.Top, Height = P(40), BackColor = Ui.Bg };
         header.Paint += PaintHeader;
@@ -521,15 +597,35 @@ class Panel : Form
         host = new ScrollHost { Dock = DockStyle.Fill, BackColor = Ui.Bg };
         Board = new Board(this) { Location = new Point(0, 0) };
         host.Controls.Add(Board);
-        host.Resize += (s, e) => Board.Width = host.ClientSize.Width;
+        host.Resize += (s, e) => { if (!anim.Enabled) Board.Width = host.ClientSize.Width; };   // no re-wrapping mid-animation
         Board.SizeChanged += (s, e) => host.Clamp();
         Board.MouseWheel += (s, e) => host.ScrollBy(e.Delta / 2);
         Board.Width = expandedSize.Width - P(20);
 
+        // The bottom bar: how the panel behaves in a Claude window and elsewhere, one click to switch each.
+        footer = new DoubleBufferedControl { Dock = DockStyle.Bottom, Height = P(24), BackColor = Ui.Bg };
+        footer.Paint += PaintFooter;
+        footer.MouseMove += (s, e) => { string hb = btnModeClaude.Contains(e.Location) ? "mc" : btnModeElse.Contains(e.Location) ? "me" : null; if (hb != hoverBtn) { hoverBtn = hb; footer.Invalidate(); footerTip.SetToolTip(footer, hb == "mc" ? ModeTip(true) : hb == "me" ? ModeTip(false) : null); } footer.Cursor = hb != null ? Cursors.Hand : Cursors.Default; };
+        footer.MouseLeave += (s, e) => { if (hoverBtn == "mc" || hoverBtn == "me") { hoverBtn = null; footer.Invalidate(); } };
+        footer.MouseDown += (s, e) =>
+        {
+            if (e.Button != MouseButtons.Left) return;
+            if (btnModeClaude.Contains(e.Location)) SwitchMode(true);
+            else if (btnModeElse.Contains(e.Location)) SwitchMode(false);
+        };
+
         Controls.Add(host);
         Controls.Add(header);
+        Controls.Add(footer);
         LoadPlace();
+        openSpot = Bounds;
+        bar = new BarWindow(this);
+        VisibleChanged += (s, e) => { if (Visible) { bar.Bounds = PillRect(); bar.Show(); } else bar.Hide(); };
+        Invalidated += (s, e) => bar.Invalidate();
+        header.Invalidated += (s, e) => bar.Invalidate();
     }
+    public BarWindow bar;
+    Rectangle openSpot;   // where the panel sits open in "stays open" mode (you can put it anywhere)
 
     public int P(float v) { return (int)Math.Round(v * S); }
 
@@ -539,6 +635,7 @@ class Panel : Form
         {
             var cp = base.CreateParams;
             cp.ExStyle |= 0x80;        // WS_EX_TOOLWINDOW: no taskbar button
+            cp.ExStyle |= 0x02000000;  // WS_EX_COMPOSITED: the whole window paints as one picture, so resizing doesn't flicker
             cp.ClassStyle |= 0x20000;  // CS_DROPSHADOW
             return cp;
         }
@@ -567,14 +664,14 @@ class Panel : Form
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
         int w = header.Width, h = header.Height;
-        if (collapsed) { PaintPill(g, w, h); return; }
         using (var b = new SolidBrush(Ui.Accent)) g.FillEllipse(b, P(14), h / 2 - P(4), P(8), P(8));
         using (var f = new Font("Segoe UI Semibold", 10.5f))
             TextRenderer.DrawText(g, "Claude Code", f, new Point(P(28), h / 2 - P(10)), Ui.Text);
         btnClose = new Rectangle(w - P(36), h / 2 - P(13), P(26), P(26));
-        btnCollapse = new Rectangle(w - P(64), h / 2 - P(13), P(26), P(26));
-        btnGear = new Rectangle(w - P(92), h / 2 - P(13), P(26), P(26));
-        DrawHeaderBtn(g, btnCollapse, "c");
+        // In hover mode there is nothing to shrink by hand: the – button only shows in "stays open" mode.
+        btnCollapse = hoverMode ? Rectangle.Empty : new Rectangle(w - P(64), h / 2 - P(13), P(26), P(26));
+        btnGear = new Rectangle(w - (hoverMode ? P(64) : P(92)), h / 2 - P(13), P(26), P(26));
+        if (!hoverMode) DrawHeaderBtn(g, btnCollapse, "c");
         DrawHeaderBtn(g, btnClose, "x");
         DrawHeaderBtn(g, btnGear, "g");
         using (var pen = new Pen(Ui.Line)) g.DrawLine(pen, 0, h - 1, w, h - 1);
@@ -596,12 +693,26 @@ class Panel : Form
         }
     }
 
+    DateTime flashUntil = DateTime.MinValue;
+    public void FlashNew() { flashUntil = DateTime.UtcNow.AddSeconds(4); }
+
+    // Draws the bar on the taskbar (its own window, see BarWindow).
+    public void PaintBar(Graphics g, int w, int h)
+    {
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        PaintPill(g, w, h);
+    }
     void PaintPill(Graphics g, int w, int h)
     {
         var st = ClaudeTray.State;
         var cur = ClaudeTray.Current();
         double five = ClaudeTray.Pct(cur, "five_hour");
         int unseen = ClaudeTray.Arr(st, "unseen").Length, working = ClaudeTray.Arr(st, "working").Length, cut = ClaudeTray.Arr(st, "cut").Length;
+        // A new answer: the bar glows amber, pulsing for a few seconds, then keeps a faint glow while any are unseen.
+        double flash = (flashUntil - DateTime.UtcNow).TotalMilliseconds;
+        int glow = flash > 0 ? (int)(60 + 70 * Math.Abs(Math.Sin(flash / 1000.0 * Math.PI * 1.5))) : unseen > 0 ? 28 : 0;
+        if (glow > 0) using (var b = new SolidBrush(Color.FromArgb(glow, Ui.Warn))) g.FillRectangle(b, 0, 0, w, h);
         int x = P(12);
         using (var b = new SolidBrush(Ui.LimitColor(double.IsNaN(five) ? (double?)null : five)))
         using (var p = Ui.Rounded(new RectangleF(x, h / 2 - P(10), P(34), P(20)), P(10))) g.FillPath(b, p);
@@ -610,73 +721,631 @@ class Panel : Form
         x += P(42);
         var parts = new List<KeyValuePair<string, Color>>();
         if (unseen > 0) parts.Add(new KeyValuePair<string, Color>(unseen + " new", Ui.Warn));
-        if (working > 0) parts.Add(new KeyValuePair<string, Color>(working + " working", Ui.Blue));
+        if (working > 0) parts.Add(new KeyValuePair<string, Color>(working + " busy", Ui.Blue));
         if (cut > 0) parts.Add(new KeyValuePair<string, Color>(cut + " cut", Ui.Bad));
         if (parts.Count == 0) parts.Add(new KeyValuePair<string, Color>("all quiet", Ui.Dim));
         using (var f = new Font("Segoe UI", 9f))
             foreach (var kv in parts)
             {
                 var sz = TextRenderer.MeasureText(g, kv.Key, f, Size.Empty, TextFormatFlags.NoPadding);
+                if (x + sz.Width > w - P(40)) break;   // the narrow bar shows what fits
                 TextRenderer.DrawText(g, kv.Key, f, new Point(x, h / 2 - sz.Height / 2), kv.Value, TextFormatFlags.NoPadding);
                 x += sz.Width + P(10);
             }
-        btnCollapse = new Rectangle(w - P(34), h / 2 - P(13), P(26), P(26));
-        btnClose = Rectangle.Empty; btnGear = Rectangle.Empty;
-        DrawHeaderBtn(g, btnCollapse, "c");
+    }
+
+    readonly ToolTip footerTip = new ToolTip();
+    string ModeTip(bool claude)
+    {
+        bool open = (claude ? set.panelInClaude : set.panelElsewhere) == "open";
+        return (claude ? "While a Claude window is in front: " : "While anything else is in front: ") + (open ? "stays open" : "opens when the mouse is over it") + " (click to switch)";
+    }
+
+    // The bottom bar: two quiet switches, a Claude window and the rest of the PC. On = stays open, off = opens on hover.
+    void PaintFooter(object sender, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        int w = footer.Width, h = footer.Height;
+        using (var pen = new Pen(Color.FromArgb(36, 36, 34))) g.DrawLine(pen, P(10), 0, w - P(10), 0);
+        int gw = P(74), cy = h / 2;
+        btnModeClaude = new Rectangle(P(10), 0, gw, h);
+        btnModeElse = new Rectangle(P(10) + gw + P(6), 0, gw, h);
+        DrawModeSwitch(g, btnModeClaude, true, set.panelInClaude == "open", ctxClaude, hoverBtn == "mc");
+        DrawModeSwitch(g, btnModeElse, false, set.panelElsewhere == "open", !ctxClaude, hoverBtn == "me");
+    }
+
+    static readonly Font fModeTiny = new Font("Segoe UI", 7f);
+    void DrawModeSwitch(Graphics g, Rectangle r, bool claude, bool on, bool current, bool hot)
+    {
+        Color ink = hot ? Ui.Dim : current ? Color.FromArgb(128, 125, 118) : Color.FromArgb(88, 86, 80);
+        int cy = r.Y + r.Height / 2, x = r.X;
+        using (var pen = new Pen(ink, 1f * S))
+        {
+            if (claude)
+            {
+                // a small window with Claude's orange spark filling it
+                var win = new Rectangle(x, cy - P(7), P(16), P(14));
+                g.DrawRectangle(pen, win);
+                g.DrawLine(pen, win.X, win.Y + P(2.5f), win.Right, win.Y + P(2.5f));
+                float sx = win.X + win.Width / 2f + 0.5f, sy = win.Y + P(8.3f), k = P(4f);
+                int alpha = hot ? 255 : current ? 220 : 120;
+                using (var sp = new Pen(Color.FromArgb(alpha, Ui.Accent), 1.3f * S) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    for (int i = 0; i < 8; i++)
+                    {
+                        // eight rays, long and short in turn: Claude's spark, readable at this size
+                        double a = Math.PI * 2 * i / 8 + 0.2;
+                        float len = k * (i % 2 == 0 ? 1.05f : 0.7f), r0 = k * 0.12f;
+                        g.DrawLine(sp, sx + r0 * (float)Math.Cos(a), sy + r0 * (float)Math.Sin(a), sx + len * (float)Math.Cos(a), sy + len * (float)Math.Sin(a));
+                    }
+            }
+            else
+            {
+                // a monitor on a stand
+                var mon = new Rectangle(x, cy - P(6), P(15), P(9));
+                g.DrawRectangle(pen, mon);
+                g.DrawLine(pen, x + P(7.5f), mon.Bottom, x + P(7.5f), mon.Bottom + P(2));
+                g.DrawLine(pen, x + P(4.5f), mon.Bottom + P(2.5f), x + P(10.5f), mon.Bottom + P(2.5f));
+            }
+        }
+        // the switch
+        // a square switch
+        var sm = g.SmoothingMode; g.SmoothingMode = SmoothingMode.None;
+        var track = new Rectangle(x + P(21), cy - P(4), P(18), P(8));
+        using (var b = new SolidBrush(on ? Color.FromArgb(70, 68, 63) : Color.FromArgb(34, 34, 32))) g.FillRectangle(b, track);
+        using (var pen = new Pen(Color.FromArgb(56, 55, 51))) g.DrawRectangle(pen, track);
+        int kd = P(6), kx = on ? track.Right - kd - P(1) : track.X + P(1) + 1;
+        using (var b = new SolidBrush(on ? (hot ? Ui.Text : Color.FromArgb(190, 188, 180)) : ink)) g.FillRectangle(b, kx, cy - kd / 2 + 1, kd, kd - 1);
+        g.SmoothingMode = sm;
+        TextRenderer.DrawText(g, on ? "open" : "hover", fModeTiny, new Point(x + P(43), cy - P(6)), ink, TextFormatFlags.NoPadding);
+    }
+
+    // Flips one context between "hover" and "stays open" (open, not shrunk), and saves it.
+    void SwitchMode(bool claude)
+    {
+        var s = Accounts.Load();
+        if (claude) { s.panelInClaude = s.panelInClaude == "open" ? "hover" : "open"; s.panelInClaudeShrunk = false; }
+        else { s.panelElsewhere = s.panelElsewhere == "open" ? "hover" : "open"; s.panelElsewhereShrunk = false; }
+        Accounts.Save(s);
+        set = s; settingsAt = DateTime.UtcNow;
+        footer.Invalidate();
     }
 
     void HeaderDown(object sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
-        if (btnCollapse.Contains(e.Location)) { SetCollapsed(!collapsed); return; }
+        if (btnCollapse.Contains(e.Location)) { ClickToggle(!targetCollapsed); return; }
         if (btnClose.Contains(e.Location)) { SavePlace(); Hide(); return; }
         if (btnGear.Contains(e.Location)) { ClaudeTray.OpenManager(); return; }
         var start = Location;
+        dragging = true;
         ReleaseCapture();
-        SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero); // drag like a title bar
-        if (collapsed && Location == start) SetCollapsed(false); // a click on the pill opens it
+        SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero); // drag like a title bar (returns when the mouse is let go)
+        dragging = false;
+        if (Location == start)
+        {
+            // A plain click on the shrunk bar reopens it (in "stays open" mode).
+            if (!hoverMode && targetCollapsed) ClickToggle(false);
+            else if (hoverMode && targetCollapsed) { hoverAt = DateTime.MinValue; AnimateTo(false); }
+            return;
+        }
+        Snap();
         SavePlace();
     }
 
-    void SetCollapsed(bool c)
+    // ---------- open / closed ----------
+    // Settings say whether the panel is open or closed while a Claude window is in front and while
+    // anything else is. When closed, the bar opens either while the mouse is on it (hover) or by a
+    // click; a click (on the bar, or on the – button) changes the setting for where you are, so it sticks.
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    public static int MenusOpen;                 // a menu from the panel is showing: stay open
+    bool dragging, ctxClaude, hoverMode, targetCollapsed, footerCtx;
+    DateTime hoverAt = DateTime.MinValue, hoverLeft = DateTime.MinValue, settingsAt = DateTime.MinValue, leftClaudeAt = DateTime.MinValue;
+    AccountSettings set = new AccountSettings();
+    uint fgPid; bool fgIsClaude; string fgName = "?", lastLogLine;
+    static readonly int MyPid = Process.GetCurrentProcess().Id;
+    Size PillSize { get { return new Size(P(216), P(40)); } }
+
+    // ---------- the shrunk bar lives on the taskbar ----------
+    // Where the taskbar is on the main screen (bottom or top). If it's hidden or on a side, a strip
+    // along the bottom of the screen instead.
+    Rectangle TaskbarStrip()
     {
-        if (c == collapsed) return;
-        var br = new Point(Right, Bottom); // keep the bottom-right corner in place
-        collapsed = c;
-        host.Visible = !c;
-        if (c) { expandedSize = Size; Size = new Size(P(270), P(40)); header.Height = P(40); }
-        else Size = expandedSize;
-        Location = new Point(br.X - Width, br.Y - Height);
+        var sc = Screen.PrimaryScreen; var b = sc.Bounds; var wa = sc.WorkingArea;
+        if (wa.Bottom < b.Bottom) return new Rectangle(b.Left, wa.Bottom, b.Width, b.Bottom - wa.Bottom);
+        if (wa.Top > b.Top) return new Rectangle(b.Left, b.Top, b.Width, wa.Top - b.Top);
+        return new Rectangle(b.Left, b.Bottom - PillSize.Height - P(4), b.Width, PillSize.Height + P(4));
+    }
+    readonly string pillFile = Path.Combine(ClaudeTray.Dir, "pill.txt");
+    int pillX = int.MinValue;   // its left edge, from the screen's left; you move it by dragging along the taskbar
+    Rectangle PillRect()
+    {
+        var tb = TaskbarStrip(); var sz = PillSize;
+        if (pillX == int.MinValue) { try { pillX = int.Parse(File.ReadAllText(pillFile).Trim()); } catch { pillX = P(8); } }
+        int x = Math.Max(tb.Left, Math.Min(tb.Left + pillX, tb.Right - sz.Width));
+        int h = Math.Min(sz.Height, tb.Height);
+        return new Rectangle(x, tb.Top + (tb.Height - h) / 2, sz.Width, h);
+    }
+    void SavePill(int left)
+    {
+        pillX = left - TaskbarStrip().Left;
+        try { File.WriteAllText(pillFile, pillX.ToString()); } catch { }
+    }
+    // The taskbar comes to the front when you click it, so put the bar back on top of it now and then
+    // (not over a full-screen app).
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    int pillTicks;
+    void KeepPillOnTaskbar()
+    {
+        if (bar == null || !bar.Visible || dragging || ++pillTicks % 8 != 0) return;
+        var fg = GetForegroundWindow(); RECT fr;
+        var sb = Screen.PrimaryScreen.Bounds;
+        if (fg != IntPtr.Zero && fg != Handle && GetWindowRect(fg, out fr) && fr.L <= sb.Left && fr.T <= sb.Top && fr.R >= sb.Right && fr.B >= sb.Bottom) return;
+        var pr = PillRect();
+        if (bar.Bounds != pr) bar.Bounds = pr;
+        SetWindowPos(bar.Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10);   // topmost, no move, no size, no focus
+    }
+
+    // The bar was pressed: drag it along the taskbar, or a plain click opens / shrinks the panel.
+    public void BarDown()
+    {
+        var start = bar.Location;
+        dragging = true;
+        ReleaseCapture();
+        SendMessage(bar.Handle, 0xA1, (IntPtr)2, IntPtr.Zero);   // drag like a title bar (returns when let go)
+        dragging = false;
+        if (bar.Location == start)
+        {
+            if (!hoverMode) ClickToggle(!targetCollapsed);
+            else if (targetCollapsed) { hoverAt = DateTime.MinValue; AnimateTo(false); }
+            return;
+        }
+        SavePill(bar.Left);
+        bar.Bounds = PillRect();
+        if (!collapsed && hoverMode) { Location = OpenRect().Location; restAt = Location; }
+    }
+    // While the bar is dragged: it stays on the taskbar, and an open panel above it comes along.
+    public void BarMoving(ref int l, ref int tp, ref int r, ref int b)
+    {
+        var tb = TaskbarStrip(); var pr = PillRect(); int pw = r - l;
+        l = Math.Max(tb.Left, Math.Min(l, tb.Right - pw)); r = l + pw;
+        tp = pr.Y; b = pr.Y + pr.Height;
+        if (!collapsed && hoverMode && !anim.Enabled) Location = OpenRect(new Rectangle(l, tp, pw, pr.Height)).Location;
+    }
+
+    // Where the panel sits when open: above the bar in hover mode, or where you put it in "stays open".
+    Rectangle OpenRect() { return OpenRect(bar != null ? PillRect() : Bounds); }
+    Rectangle OpenRect(Rectangle pill)
+    {
+        var wa = Screen.PrimaryScreen.WorkingArea;
+        var size = expandedSize;
+        if (!hoverMode && openSpot.Width > 0)
+        {
+            var r = new Rectangle(openSpot.Location, size);
+            r.X = Math.Max(wa.Left, Math.Min(r.X, wa.Right - r.Width));
+            r.Y = Math.Max(wa.Top, Math.Min(r.Y, wa.Bottom - r.Height));
+            return r;
+        }
+        bool right = pill.Left + pill.Width / 2 > wa.Left + wa.Width / 2;
+        bool top = TaskbarStrip().Top < wa.Top + wa.Height / 2;
+        var o = new Rectangle(right ? pill.Right - size.Width : pill.Left, top ? wa.Top : wa.Bottom - size.Height, size.Width, size.Height);
+        o.X = Math.Max(wa.Left, Math.Min(o.X, wa.Right - o.Width));
+        o.Y = Math.Max(wa.Top, Math.Min(o.Y, wa.Bottom - o.Height));
+        return o;
+    }
+
+    bool InFront(out bool mine)
+    {
+        uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+        mine = pid == MyPid;
+        if (pid != fgPid)
+        {
+            fgPid = pid; fgIsClaude = false; fgName = "?";
+            try { using (var p = Process.GetProcessById((int)pid)) { fgName = p.ProcessName; fgIsClaude = string.Equals(p.ProcessName, "claude", StringComparison.OrdinalIgnoreCase); } } catch { }
+        }
+        return fgIsClaude;
+    }
+
+    AccountSettings Settings()
+    {
+        if ((DateTime.UtcNow - settingsAt).TotalSeconds > 1) { set = Accounts.Load(); settingsAt = DateTime.UtcNow; if (footer != null) footer.Invalidate(); }
+        return set;
+    }
+    // Older settings said "closed" for what is now hover mode.
+    bool HoverModeFor(AccountSettings s) { return (ctxClaude ? s.panelInClaude : s.panelElsewhere) != "open"; }
+    bool ShrunkFor(AccountSettings s) { return ctxClaude ? s.panelInClaudeShrunk : s.panelElsewhereShrunk; }
+
+    // Runs every 40 ms: cheap (front window and mouse position; the process is looked up only when the front window changes).
+    public void AutoTick()
+    {
+        if (!Visible || dragging) return;
+        var s = Settings();
+        bool mine;
+        bool onClaude = InFront(out mine);
+        // While you use the panel itself, keep the rule of where you came from. Coming to Claude counts at
+        // once; leaving it counts only after 0.15 s, because switching between two Claude windows passes
+        // through the taskbar for a split second.
+        // Switching windows takes effect at once. The taskbar itself doesn't count: clicking it to go
+        // from one Claude window to another passes through it for a split second.
+        bool switched = false;
+        if (!mine && !OnTaskbar() && onClaude != ctxClaude) { ctxClaude = onClaude; switched = true; }
+        bool hm = HoverModeFor(s);
+        if (hm != hoverMode) { hoverMode = hm; header.Invalidate(); }
+        if (ctxClaude != footerCtx) { footerCtx = ctxClaude; footer.Invalidate(); }
+        // Judge the mouse against where the panel is heading, not the in-between frame of the animation,
+        // with a small margin, so it doesn't flicker open/closed while growing or at the very edge.
+        // While shrinking, the mouse coming back onto what is still showing counts too, so it reopens
+        // instead of finishing the close first.
+        var zone = collapsed ? Rectangle.Empty : anim.Enabled && !targetCollapsed ? animTo : Bounds;
+        if (!zone.IsEmpty) zone.Inflate(P(6), P(6));
+        // It grows up from the taskbar, so the bar's spot there counts too (on its own, not everything in between).
+        var pillZone = PillRect(); pillZone.Inflate(P(6), P(6));
+        var mp = Control.MousePosition;
+        bool hover = zone.Contains(mp) || (hoverMode && pillZone.Contains(mp)) || MenusOpen > 0;
+        if (!hover) hoverAt = DateTime.MinValue;
+        bool open;
+        if (hoverMode)
+        {
+            // A small bar; open only while the mouse is over it (and a moment after it leaves).
+            open = false;
+            if (hover)
+            {
+                hoverLeft = DateTime.MinValue;
+                // Shrunk: open once the mouse rests on the bar for a moment, so passing over the taskbar
+                // doesn't pop it and you can grab the bar to slide it first.
+                if (!targetCollapsed) open = true;
+                else
+                {
+                    if (hoverAt == DateTime.MinValue) hoverAt = DateTime.UtcNow;
+                    open = (DateTime.UtcNow - hoverAt).TotalMilliseconds >= 220;
+                }
+            }
+            // Just switched windows and the mouse isn't on it: close now, no lingering.
+            else if (!targetCollapsed && switched) open = false;
+            else if (!targetCollapsed && hoverLeft == DateTime.MinValue) { hoverLeft = DateTime.UtcNow; open = true; }
+            else if (!targetCollapsed && (DateTime.UtcNow - hoverLeft).TotalMilliseconds < 450) open = true;
+        }
+        else open = !ShrunkFor(s);   // stays open over other windows unless you shrank it here
+        if (open == targetCollapsed)
+        {
+            // Switching between open windows: appear or disappear at once. When a Claude window is being
+            // minimised or brought back (Windows animates it), fade along with it. The mouse always fades.
+            bool withClaude = DateTime.UtcNow < claudeAnimUntil;
+            if (switched && !withClaude) SwitchNow(!open);
+            else AnimateTo(!open);
+        }
+        KeepPillOnTaskbar();
+        Log("front=" + fgName + " claude=" + ctxClaude + " hover=" + hover + " open=" + open);
+        if (DateTime.UtcNow < flashUntil.AddMilliseconds(100) && bar != null) bar.Invalidate();   // animate the glow
+    }
+
+    void Log(string line)
+    {
+        if (line == lastLogLine) return;
+        lastLogLine = line;
+        try
+        {
+            var log = Path.Combine(ClaudeTray.Dir, "auto.log");
+            if (File.Exists(log) && new FileInfo(log).Length > 200000) File.Delete(log);
+            File.AppendAllText(log, DateTime.Now.ToString("HH:mm:ss.ff") + " " + line + Environment.NewLine);
+        }
+        catch { }
+    }
+
+    // In "stays open" mode: the – button shrinks it, a click on the bar reopens it; remembered for that place.
+    void ClickToggle(bool collapse)
+    {
+        var s = Accounts.Load();
+        if (ctxClaude) s.panelInClaudeShrunk = collapse; else s.panelElsewhereShrunk = collapse;
+        Accounts.Save(s);
+        set = s; settingsAt = DateTime.UtcNow;
+        AnimateTo(collapse);
+    }
+
+    // ---------- animation ----------
+    // Grows from (and shrinks to) the corner nearest the screen's corner, so a panel stuck to an edge stays stuck.
+    readonly System.Windows.Forms.Timer anim = new System.Windows.Forms.Timer { Interval = 5 };
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
+    bool fineTimer;
+    Rectangle animFrom, animTo; DateTime animStart; bool animHooked;
+    double AnimMs { get { return targetCollapsed ? 170 : 230; } }
+
+    // No animation: show or hide the panel at once. It stays fully drawn while hidden, so showing it
+    // is immediate (nothing to lay out or paint).
+    void SwitchNow(bool c)
+    {
+        bool wasAnim = anim.Enabled;
+        anim.Stop();
+        if (fineTimer) { timeEndPeriod(1); fineTimer = false; }
+        hoverAt = DateTime.MinValue; hoverLeft = DateTime.MinValue;
+        targetCollapsed = c;
+        Opacity = Rest;
+        if (c)
+        {
+            if (wasAnim) Location = restAt;
+            collapsed = true;
+            Reveal(false);
+        }
+        else
+        {
+            var to = OpenRect();
+            if (Bounds != to) Bounds = to;
+            restAt = to.Location;
+            collapsed = false;
+            Reveal(true);
+        }
+    }
+
+    // Hidden: cloaked (Windows keeps its picture but shows nothing) and clicks pass through it.
+    void Reveal(bool show)
+    {
+        Cloak(!show);
+        if (!IsHandleCreated) return;
+        int ex = GetWindowLong(Handle, -20);
+        int want = show ? ex & ~0x20 : ex | 0x20;   // WS_EX_TRANSPARENT
+        if (want != ex) SetWindowLong(Handle, -20, want);
+    }
+
+    [DllImport("dwmapi.dll")] static extern int DwmFlush();
+    void Cloak(bool on)
+    {
+        if (!IsHandleCreated) return;
+        int v = on ? 1 : 0;
+        try { DwmSetWindowAttribute(Handle, 13 /* DWMWA_CLOAK */, ref v, 4); } catch { }
+    }
+
+    // The taskbar (or its overflow / Start) is in front.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+    static bool OnTaskbar()
+    {
+        var sb = new System.Text.StringBuilder(64);
+        GetClassName(GetForegroundWindow(), sb, 64);
+        string c = sb.ToString();
+        return c == "Shell_TrayWnd" || c == "Shell_SecondaryTrayWnd" || c == "NotifyIconOverflowWindow" || c == "TopLevelWindowForOverflowXamlIsland" || c == "Windows.UI.Core.CoreWindow";
+    }
+
+    // React the moment a different window comes to the front, not on the next check.
+    delegate void WinEventProc(IntPtr hook, uint ev, IntPtr h, int obj, int child, uint thread, uint time);
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc proc, uint pid, uint tid, uint flags);
+    WinEventProc fgProc, minProc; IntPtr fgHook, minHook;
+    DateTime claudeAnimUntil = DateTime.MinValue;   // a Claude window is minimising or coming back right now
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    public void WatchForeground()
+    {
+        if (fgHook != IntPtr.Zero) return;
+        fgProc = (hk, ev, h, obj, child, th, tm) =>
+        {
+            try
+            {
+                // Brought back from the taskbar: it can still be minimised the moment it comes to the front.
+                if (obj == 0 && IsIconic(h) && IsClaude(h)) claudeAnimUntil = DateTime.UtcNow.AddMilliseconds(700);
+                AutoTick();
+            }
+            catch { }
+        };
+        fgHook = SetWinEventHook(3 /* EVENT_SYSTEM_FOREGROUND */, 3, IntPtr.Zero, fgProc, 0, 0, 0);
+        minProc = (hk, ev, h, obj, child, th, tm) =>
+        {
+            try
+            {
+                if (obj != 0 || !IsClaude(h)) return;
+                claudeAnimUntil = DateTime.UtcNow.AddMilliseconds(700);
+                AutoTick();
+            }
+            catch { }
+        };
+        minHook = SetWinEventHook(0x16 /* MINIMIZESTART */, 0x17 /* MINIMIZEEND */, IntPtr.Zero, minProc, 0, 0, 0);
+    }
+    static bool IsClaude(IntPtr h)
+    {
+        uint pid; GetWindowThreadProcessId(h, out pid);
+        try { using (var p = Process.GetProcessById((int)pid)) return string.Equals(p.ProcessName, "claude", StringComparison.OrdinalIgnoreCase); } catch { return false; }
+    }
+
+    void AnimateTo(bool c)
+    {
+        if (c && collapsed) { targetCollapsed = true; return; }
+        targetCollapsed = c;
+        int rise = P(22);
+        animStart = DateTime.UtcNow;
+        if (!c)
+        {
+            var to = OpenRect();
+            if (collapsed)
+            {
+                // From hidden: at full size, invisible, a little lower; then fade in and rise.
+                Opacity = 0;
+                Bounds = new Rectangle(to.X, to.Y + rise, to.Width, to.Height);
+                collapsed = false;
+                Reveal(true);
+            }
+            posTo = to.Location; fadeTo = Rest; restAt = to.Location;
+        }
+        else
+        {
+            if (!anim.Enabled) restAt = Location;
+            posTo = new Point(restAt.X, restAt.Y + rise); fadeTo = 0;
+        }
+        animFrom = Bounds; animTo = new Rectangle(posTo, Size);
+        posFrom = Location; fadeFrom = Opacity;
+        if (!animHooked) { anim.Tick += AnimStep; animHooked = true; }
+        if (!fineTimer) { timeBeginPeriod(1); fineTimer = true; }   // frames every few ms instead of every 16
+        anim.Start();
+    }
+
+    const double Rest = 0.999;   // just under fully solid, so the window stays fadeable and never flashes switching modes
+    Point posFrom, posTo, restAt; double fadeFrom, fadeTo;
+
+    void AnimStep(object sender, EventArgs e)
+    {
+        double t = Math.Min(1, (DateTime.UtcNow - animStart).TotalMilliseconds / AnimMs);
+        // Opening: quick start, long soft landing. Closing: eases in and out.
+        double k = targetCollapsed ? (t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2) : 1 - Math.Pow(1 - t, 5);
+        Func<int, int, int> mix = (a, b) => (int)Math.Round(a + (b - a) * k);
+        Location = new Point(mix(posFrom.X, posTo.X), mix(posFrom.Y, posTo.Y));
+        Opacity = fadeFrom + (fadeTo - fadeFrom) * k;
+        if (t < 1) return;
+        anim.Stop();
+        if (fineTimer) { timeEndPeriod(1); fineTimer = false; }
+        if (targetCollapsed)
+        {
+            // Faded away: hide it, ready to come straight back at its spot.
+            collapsed = true;
+            Reveal(false);
+            Location = restAt;
+            Opacity = Rest;
+        }
+    }
+
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+    [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
+    void Composited(bool on)
+    {
+        if (!IsHandleCreated) return;
+        const int GWL_EXSTYLE = -20, WS_EX_COMPOSITED = 0x02000000;
+        int ex = GetWindowLong(Handle, GWL_EXSTYLE);
+        int want = on ? ex | WS_EX_COMPOSITED : ex & ~WS_EX_COMPOSITED;
+        if (want != ex) SetWindowLong(Handle, GWL_EXSTYLE, want);
+    }
+
+    // ---------- sticking to the taskbar and the screen's sides ----------
+    Rectangle SnapRect(Rectangle r)
+    {
+        var wa = Screen.FromRectangle(r).WorkingArea;
+        int near = P(40), x = r.X, y = r.Y;
+        if (Math.Abs(r.Left - wa.Left) < near) x = wa.Left;
+        else if (Math.Abs(wa.Right - r.Right) < near) x = wa.Right - r.Width;
+        if (Math.Abs(r.Top - wa.Top) < near) y = wa.Top;
+        else if (Math.Abs(wa.Bottom - r.Bottom) < near) y = wa.Bottom - r.Height;   // right on top of the taskbar
+        return new Rectangle(x, y, r.Width, r.Height);
+    }
+    void Snap()
+    {
+        if (hoverMode)
+        {
+            // Moving the open panel moves the bar's spot on the taskbar under it (by its nearer side).
+            var wa = Screen.FromRectangle(Bounds).WorkingArea;
+            bool right = Left + Width / 2 > wa.Left + wa.Width / 2;
+            SavePill(right ? Right - PillSize.Width : Left);
+            KeepOnScreen();
+            if (bar != null) bar.Bounds = PillRect();
+            restAt = Location;
+            return;
+        }
+        Location = SnapRect(Bounds).Location;
         KeepOnScreen();
-        header.Invalidate();
-        SavePlace();
+        openSpot = Bounds; restAt = Location;
+    }
+
+    // ---------- resizing and the snap preview ----------
+    int MinW { get { return P(300); } }
+    int MinH { get { return P(240); } }
+    SnapGhost ghost;
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_NCHITTEST = 0x84, WM_SIZING = 0x214, WM_MOVING = 0x216, WM_EXITSIZEMOVE = 0x232;
+        if (m.Msg == WM_NCHITTEST && !collapsed && !anim.Enabled)
+        {
+            long lp = m.LParam.ToInt64();
+            var pt = PointToClient(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
+            int g = Padding.Left + P(2);
+            bool l = pt.X < g, r = pt.X >= Width - g, t = pt.Y < g, b = pt.Y >= Height - g;
+            int code = t && l ? 13 : t && r ? 14 : b && l ? 16 : b && r ? 17 : l ? 10 : r ? 11 : t ? 12 : b ? 15 : 0;
+            if (code != 0) { m.Result = (IntPtr)code; return; }
+        }
+        else if (m.Msg == WM_SIZING)
+        {
+            // Keep it from getting too small to read.
+            var rc = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+            int edge = m.WParam.ToInt32();
+            if (rc.R - rc.L < MinW) { if (edge == 1 || edge == 4 || edge == 7) rc.L = rc.R - MinW; else rc.R = rc.L + MinW; }
+            if (rc.B - rc.T < MinH) { if (edge == 3 || edge == 4 || edge == 5) rc.T = rc.B - MinH; else rc.B = rc.T + MinH; }
+            Marshal.StructureToPtr(rc, m.LParam, false);
+        }
+        else if (m.Msg == WM_MOVING)
+        {
+            // While dragging, show where it will stick if let go here.
+            var rc = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+            if (hoverMode && !collapsed)
+            {
+                // Opened from the taskbar: it slides left or right along it, and can't be pulled off it.
+                var wa2 = Screen.FromRectangle(Bounds).WorkingArea; int pw2 = rc.R - rc.L;
+                rc.L = Math.Max(wa2.Left, Math.Min(rc.L, wa2.Right - pw2)); rc.R = rc.L + pw2;
+                rc.T = Top; rc.B = Bottom;
+                Marshal.StructureToPtr(rc, m.LParam, false);
+                if (bar != null)
+                {
+                    // The bar on the taskbar follows along under it.
+                    bool rgt = rc.L + pw2 / 2 > wa2.Left + wa2.Width / 2;
+                    var tb2 = TaskbarStrip(); int bx = rgt ? rc.R - bar.Width : rc.L;
+                    bar.Left = Math.Max(tb2.Left, Math.Min(bx, tb2.Right - bar.Width));
+                }
+                m.Result = (IntPtr)1;
+                return;
+            }
+            var r = new Rectangle(rc.L, rc.T, rc.R - rc.L, rc.B - rc.T);
+            var s = SnapRect(r);
+            if (s != r)
+            {
+                if (ghost == null) ghost = new SnapGhost();
+                ghost.Bounds = s;
+                if (!ghost.Visible) ghost.Show();
+            }
+            else if (ghost != null && ghost.Visible) ghost.Hide();
+        }
+        else if (m.Msg == 0x231)   // WM_ENTERSIZEMOVE: hold still while you drag or resize
+            dragging = true;
+        else if (m.Msg == WM_EXITSIZEMOVE)
+        {
+            dragging = false;
+            if (ghost != null && ghost.Visible) ghost.Hide();
+            if (!collapsed && !anim.Enabled) { expandedSize = Size; SavePlace(); if (!hoverMode) openSpot = Bounds; restAt = Location; }
+        }
+        base.WndProc(ref m);
     }
 
     void KeepOnScreen()
     {
-        var wa = Screen.FromPoint(Location).WorkingArea;
+        var wa = Screen.FromRectangle(Bounds).WorkingArea;
         Location = new Point(Math.Max(wa.Left, Math.Min(Left, wa.Right - Width)), Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height)));
     }
 
+    // Saved as the corner it grows from, so it comes back in the same spot whatever its size.
     void LoadPlace()
     {
         var wa = Screen.PrimaryScreen.WorkingArea;
-        Location = new Point(wa.Right - Width - P(12), wa.Bottom - Height - P(12));
+        Location = new Point(wa.Right - Width, wa.Bottom - Height);
         try
         {
             var parts = File.ReadAllText(placeFile).Split(',');
-            int right = int.Parse(parts[0]), bottom = int.Parse(parts[1]);
-            bool c = parts.Length > 2 && parts[2] == "1";
-            Location = new Point(right - Width, bottom - Height);
+            if (parts[0] == "v2")
+            {
+                int ax = int.Parse(parts[1]), ay = int.Parse(parts[2]);
+                bool right = parts[3] == "R", bottom = parts[4] == "B";
+                if (parts.Length > 6) { expandedSize = new Size(Math.Max(MinW, int.Parse(parts[5])), Math.Max(MinH, int.Parse(parts[6]))); Size = expandedSize; }
+                Location = new Point(right ? ax - Width : ax, bottom ? ay - Height : ay);
+            }
+            else Location = new Point(int.Parse(parts[0]) - Width, int.Parse(parts[1]) - Height);
             KeepOnScreen();
-            if (c) SetCollapsed(true);
         }
         catch { }
     }
 
     public void SavePlace()
     {
-        try { File.WriteAllText(placeFile, Right + "," + Bottom + "," + (collapsed ? "1" : "0")); } catch { }
+        try
+        {
+            var wa = Screen.FromRectangle(Bounds).WorkingArea;
+            bool right = Left + Width / 2 > wa.Left + wa.Width / 2, bottom = Top + Height / 2 > wa.Top + wa.Height / 2;
+            File.WriteAllText(placeFile, "v2," + (right ? Right : Left) + "," + (bottom ? Bottom : Top) + "," + (right ? "R" : "L") + "," + (bottom ? "B" : "T") + "," + expandedSize.Width + "," + expandedSize.Height);
+        }
+        catch { }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -684,6 +1353,33 @@ class Panel : Form
         if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
         base.OnFormClosing(e);
     }
+}
+
+// The see-through outline showing where the panel will stick when you let go of it.
+class SnapGhost : Form
+{
+    public SnapGhost()
+    {
+        FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; TopMost = true;
+        StartPosition = FormStartPosition.Manual; BackColor = Ui.Accent; Opacity = 0.28;
+    }
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x80 | 0x20 | 0x08000000;   // tool window, clicks pass through, never takes focus
+            return cp;
+        }
+    }
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        int round = 2;
+        try { DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { }
+    }
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
 }
 
 class DoubleBufferedControl : Control
@@ -924,6 +1620,8 @@ class Board : DoubleBufferedControl
             menu.Items.Add("Continue in a new chat on " + (string)a["name"], null, (s, e) => ClaudeTray.Handoff(sid, nn));
         }
         if (menu.Items.Count == 0) menu.Items.Add("No accounts can be opened").Enabled = false;
+        menu.Opened += (s, e) => Panel.MenusOpen++;
+        menu.Closed += (s, e) => Panel.MenusOpen = Math.Max(0, Panel.MenusOpen - 1);
         menu.Show(this, new Point(at.Left, at.Bottom));
     }
 
@@ -932,6 +1630,14 @@ class Board : DoubleBufferedControl
         int h = RowHeight(it, key);
         var r = new Rectangle(x, y, w, h - P(2));
         string link = it["open"] as string;
+        string rsid = it.ContainsKey("sessionId") ? it["sessionId"] as string : null;
+        if (rsid != null && Data.OnScreen.Contains(rsid))
+        {
+            // The conversation open in that account's window: a faint warm tint, a little stronger in the window in front.
+            bool front = Data.OnScreenFront.Contains(rsid);
+            using (var p = Ui.Rounded(r, P(7))) using (var b = new SolidBrush(Color.FromArgb(front ? 30 : 16, Ui.Accent))) g.FillPath(b, p);
+            using (var b = new SolidBrush(Color.FromArgb(front ? 170 : 90, Ui.Accent))) g.FillRectangle(b, r.X, r.Y + P(8), P(2), r.Height - P(16));
+        }
         if (link != null)
         {
             if (r.Contains(mouse)) using (var p = Ui.Rounded(r, P(7))) using (var b = new SolidBrush(Ui.Hover)) g.FillPath(b, p);
@@ -959,6 +1665,10 @@ class Board : DoubleBufferedControl
         else using (var b = new SolidBrush(Ui.Bad)) g.FillEllipse(b, dotR);
 
         int tx = x + P(24), tw = w - P(24) - P(56);
+        bool showBtns = rowHover && sid != null;
+        // With the three buttons showing, the title and the line under it stop short of them.
+        if (showBtns) tw = w - P(24) - P(92);
+        int detailW = showBtns ? tw : tw + P(48);
         if (rowHover && sid != null)
         {
             // Hover buttons, right to left: finish, pin, hand off.
@@ -987,7 +1697,7 @@ class Board : DoubleBufferedControl
         ty += P(18);
         if (realKey != "working" && it["detail"] != null)
         {
-            TextRenderer.DrawText(g, (string)it["detail"], fSmall, new Rectangle(tx, ty, tw + P(48), P(15)), Ui.Dim, flags);
+            TextRenderer.DrawText(g, (string)it["detail"], fSmall, new Rectangle(tx, ty, detailW, P(15)), Ui.Dim, flags);
             ty += P(15);
         }
         var meta = new List<string>();
@@ -1008,7 +1718,7 @@ class Board : DoubleBufferedControl
             mx += TextRenderer.MeasureText(g, ctxText, fTiny, Size.Empty, TextFormatFlags.NoPadding).Width;
             if (meta.Count > 0) { TextRenderer.DrawText(g, " · ", fTiny, new Point(mx, ty), Ui.Faint, TextFormatFlags.NoPadding); mx += TextRenderer.MeasureText(g, " · ", fTiny, Size.Empty, TextFormatFlags.NoPadding).Width; }
         }
-        TextRenderer.DrawText(g, string.Join(" · ", meta), fTiny, new Rectangle(mx, ty, Math.Max(0, tx + tw + P(48) - mx), P(14)), Ui.Faint, flags);
+        TextRenderer.DrawText(g, string.Join(" · ", meta), fTiny, new Rectangle(mx, ty, Math.Max(0, tx + (showBtns && ty < y + P(30) ? tw : tw + P(48)) - mx), P(14)), Ui.Faint, flags);
         return h;
     }
 }

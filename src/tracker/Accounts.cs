@@ -32,6 +32,19 @@ public class AccountSettings
     public List<AccountInfo> accounts = new List<AccountInfo>();
     // How long a conversation waiting for you stays in the panel (pinned ones always stay).
     public int hideAfterMinutes = 60;
+    // Close the background helper of a conversation that has sat idle longer than hideAfterMinutes
+    // (at least 15 minutes) to free its memory. The app starts a new one when you use it again.
+    public bool closeIdleHelpers = true;
+    // How the panel behaves while a Claude window is in front, and while anything else is:
+    //   "hover": a small bar that opens while the mouse is over it;
+    //   "open":  stays open over other windows; the – button shrinks it to the bar, a click on the bar reopens it.
+    public string panelInClaude = "open";
+    public string panelElsewhere = "hover";
+    // In "open" mode, whether you shrank it there (remembered).
+    public bool panelInClaudeShrunk = false;
+    public bool panelElsewhereShrunk = false;
+    // Send each account a one-line message when its 5-hour window isn't running, so the clock starts.
+    public bool keepClock = false;
     // When a conversation hits a usage limit: "off", "ask" (a notification to click) or "auto".
     public string autoHandoff = "ask";
     // Which account counts as freest: "weekly", "five" (5-hour) or "both" (the fuller of the two decides).

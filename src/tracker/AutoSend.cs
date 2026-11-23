@@ -27,27 +27,41 @@ static class AutoSend
     }
 
     // On the UI thread (the low-level hooks need its message loop).
+    // Holds all other input (yours and other programs', such as another Claude session driving the
+    // screen), brings the window forward, and presses Enter the moment it is in front, trying again a
+    // few times if something else takes the front in between.
     public static void PressEnter(IntPtr win, Action<bool> done)
     {
         Lock();
-        var safety = new System.Windows.Forms.Timer { Interval = 1500 };   // never hold input longer than this
+        var safety = new System.Windows.Forms.Timer { Interval = 2000 };   // never hold input longer than this
         safety.Tick += (s, e) => { safety.Stop(); safety.Dispose(); Unlock(); };
         safety.Start();
         Data.Focus(win);
-        var t = new System.Windows.Forms.Timer { Interval = 250 };
+        int tries = 0;
+        var t = new System.Windows.Forms.Timer { Interval = 150 };
         t.Tick += (s, e) =>
         {
+            tries++;
+            bool front = GetForegroundWindow() == win;
+            if (!front && tries < 8) { Data.Focus(win); return; }
             t.Stop(); t.Dispose();
-            bool ok = GetForegroundWindow() == win;
-            if (ok) SendEnter();
+            if (front) SendEnter();
+            Note("enter " + (front ? "sent" : "not sent, window not in front") + " after " + tries + " tries");
             var release = new System.Windows.Forms.Timer { Interval = 150 };
-            release.Tick += (s2, e2) => { release.Stop(); release.Dispose(); Unlock(); done(ok); };
+            release.Tick += (s2, e2) => { release.Stop(); release.Dispose(); Unlock(); done(front); };
             release.Start();
         };
         t.Start();
     }
 
-    // ---------- holding input still: swallow real mouse and key events, let our own Enter through ----------
+    static void Note(string line)
+    {
+        try { System.IO.File.AppendAllText(System.IO.Path.Combine(ClaudeTray.Dir, "handoff.log"), DateTime.Now.ToString("MM-dd HH:mm:ss.ff") + " " + line + Environment.NewLine); } catch { }
+    }
+
+    // ---------- holding input still: swallow every mouse and key event, real or sent by another program,
+    // except our own Enter (marked with Mine) ----------
+    static readonly IntPtr Mine = (IntPtr)0x434C5452;
     static IntPtr kbHook = IntPtr.Zero, msHook = IntPtr.Zero;
     static readonly HookProc kbProc = KeyboardProc, msProc = MouseProc;   // kept alive while hooked
 
@@ -69,8 +83,8 @@ static class AutoSend
     {
         if (code >= 0)
         {
-            uint flags = (uint)Marshal.ReadInt32(l, 8);
-            if ((flags & 0x10) == 0) return (IntPtr)1;   // a real key press: hold it
+            IntPtr extra = Marshal.ReadIntPtr(l, 16);
+            if (extra != Mine) return (IntPtr)1;   // anyone else's key: hold it
         }
         return CallNextHookEx(IntPtr.Zero, code, w, l);
     }
@@ -79,8 +93,7 @@ static class AutoSend
     {
         if (code >= 0)
         {
-            uint flags = (uint)Marshal.ReadInt32(l, 12);
-            if ((flags & 0x1) == 0) return (IntPtr)1;    // real mouse movement or click: hold it
+            return (IntPtr)1;    // any mouse movement or click, real or sent: hold it
         }
         return CallNextHookEx(IntPtr.Zero, code, w, l);
     }
@@ -88,8 +101,8 @@ static class AutoSend
     static void SendEnter()
     {
         var inputs = new INPUT[2];
-        inputs[0].type = 1; inputs[0].ki.wVk = 0x0D;
-        inputs[1].type = 1; inputs[1].ki.wVk = 0x0D; inputs[1].ki.dwFlags = 2;   // key up
+        inputs[0].type = 1; inputs[0].ki.wVk = 0x0D; inputs[0].ki.dwExtraInfo = Mine;
+        inputs[1].type = 1; inputs[1].ki.wVk = 0x0D; inputs[1].ki.dwFlags = 2; inputs[1].ki.dwExtraInfo = Mine;   // key up
         SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 

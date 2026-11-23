@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -32,6 +32,20 @@ class ManageForm : Form
     bool busy;
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
 
+    // Dark title bar and a thin dark border to match the panel, instead of Windows' light frame.
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Func<Color, int> cref = c => c.R | (c.G << 8) | (c.B << 16);
+        int dark = 1, border = cref(Ui.Line), caption = cref(Ui.Bg), text = cref(Ui.Text), round = 2;
+        try { DwmSetWindowAttribute(Handle, 20, ref dark, 4); } catch { }
+        try { DwmSetWindowAttribute(Handle, 34, ref border, 4); } catch { }
+        try { DwmSetWindowAttribute(Handle, 35, ref caption, 4); } catch { }
+        try { DwmSetWindowAttribute(Handle, 36, ref text, 4); } catch { }
+        try { DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { }
+    }
+
     public ManageForm()
     {
         using (var g = CreateGraphics()) S = g.DpiX / 96f;
@@ -41,7 +55,8 @@ class ManageForm : Form
         Font = new Font("Segoe UI", 9.5f);
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(P(620), P(680));
+        TopMost = true;   // always above the panel, which is itself always on top
+        ClientSize = new Size(P(620), P(802));
 
         var title = new Label { Text = "Your Claude accounts", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(P(18), P(14)) };
         var hint = new Label
@@ -98,8 +113,31 @@ class ManageForm : Form
         });
         capFive.Location = new Point(P(468), P(580));
 
+        // The panel, separately for a Claude window in front and for anything else: opens on hover, or stays open.
+        var modeNames = new[] { "Small bar, opens when the mouse is over it", "Stays open (– shrinks it, click the bar to reopen)" };
+        var inLabel = new Label { Text = "While a Claude window is in front", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(630)) };
+        var inClaude = MakeChoice(modeNames, s0.panelInClaude == "open" ? 1 : 0, P(330), idx =>
+        {
+            var st = Accounts.Load(); st.panelInClaude = idx == 1 ? "open" : "hover"; st.panelInClaudeShrunk = false; Accounts.Save(st);
+        });
+        inClaude.Location = new Point(P(270), P(624));
+        var outLabel = new Label { Text = "While anything else is in front", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(668)) };
+        var outside = MakeChoice(modeNames, s0.panelElsewhere == "open" ? 1 : 0, P(330), idx =>
+        {
+            var st = Accounts.Load(); st.panelElsewhere = idx == 1 ? "open" : "hover"; st.panelElsewhereShrunk = false; Accounts.Save(st);
+        });
+        outside.Location = new Point(P(270), P(662));
+        var clockLabel = new Label { Text = "Start each account's 5-hour clock", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(706)) };
+        var clock = MakeChoice(new[] { "Off", "Automatically, while I'm away from the PC" }, s0.keepClock ? 1 : 0, P(330), idx =>
+        {
+            var st = Accounts.Load(); st.keepClock = idx == 1; Accounts.Save(st);
+        });
+        clock.Location = new Point(P(270), P(700));
+        tip.SetToolTip(clock, "When an account's 5-hour limit isn't counting down, it gets a one-line message in a new chat so the\n5 hours start now. This opens that chat and presses Enter, so it only happens after 2 minutes without\nmouse or keyboard use. These chats don't show in the panel.");
+        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock });
+
         addBtn = MakeButton("+ Add account", P(130));
-        addBtn.Location = new Point(P(18), P(630));
+        addBtn.Location = new Point(P(18), P(752));
         // Adding an account opens it straight away on Claude's sign-in screen.
         addBtn.Click += (s, e) =>
         {
@@ -112,7 +150,7 @@ class ManageForm : Form
                 return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
             });
         };
-        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(628)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(750)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
         Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, byLabel, by, capLabel, capWeek, orLabel, capFive, addBtn, status });
         Reload();
     }

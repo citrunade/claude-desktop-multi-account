@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -127,18 +127,30 @@ static class Data
         }
         return f;
     }
+    // Reading a whole transcript (often 10+ MB) is the costly part, so these are kept per file across
+    // growth: the title is re-read at most once a minute, the account never changes once found.
+    static readonly Dictionary<string, KeyValuePair<DateTime, string>> titleByPath = new Dictionary<string, KeyValuePair<DateTime, string>>();
+    static readonly Dictionary<string, string> orgByPath = new Dictionary<string, string>();
     static string TitleFromFile(string path, FileFacts f)
     {
         if (f.HaveTitle) return f.Title;
+        KeyValuePair<DateTime, string> c;
+        lock (titleByPath)
+            if (titleByPath.TryGetValue(path, out c) && (DateTime.UtcNow - c.Key).TotalSeconds < 60) { f.Title = c.Value; f.HaveTitle = true; return f.Title; }
         var text = ReadAllShared(path);
         string t = LastMatch(text, TitleRe) ?? LastMatch(text, AgentRe);
         f.Title = t == null ? null : Unescape(t); f.HaveTitle = true;
+        lock (titleByPath) titleByPath[path] = new KeyValuePair<DateTime, string>(DateTime.UtcNow, f.Title);
         return f.Title;
     }
     static string OrgFromFile(string path, FileFacts f)
     {
         if (f.HaveOrg) return f.Org;
+        string known;
+        lock (orgByPath)
+            if (orgByPath.TryGetValue(path, out known)) { f.Org = known; f.HaveOrg = true; return known; }
         f.Org = LastMatch(ReadAllShared(path), OrgRe); f.HaveOrg = true;
+        if (f.Org != null) lock (orgByPath) orgByPath[path] = f.Org;
         return f.Org;
     }
 
@@ -273,40 +285,221 @@ static class Data
             catch { }
 
         var outp = new Dictionary<string, Dictionary<string, object>>();
-        foreach (var root in roots)
+        lock (recCache)
         {
-            if (!Directory.Exists(root)) continue;
-            try
+            var seenPaths = new HashSet<string>();
+            foreach (var root in roots)
             {
-                foreach (var d1 in Directory.GetDirectories(root))
-                    foreach (var d2 in Directory.GetDirectories(d1))
-                        foreach (var path in Directory.GetFiles(d2, "local_*.json"))
-                        {
-                            var d = ReadJson(path);
-                            if (d == null) continue;
-                            d["_org"] = Path.GetFileName(d2);
-                            d["_root"] = usual.ContainsKey(root) ? usual[root] : Path.GetDirectoryName(root);
-                            foreach (var key in new[] { Str(d, "cliSessionId"), Str(d, "lastAssistantCliSessionId") })
+                if (!Directory.Exists(root)) continue;
+                try
+                {
+                    foreach (var d1 in Directory.GetDirectories(root))
+                        foreach (var d2 in Directory.GetDirectories(d1))
+                            foreach (var path in Directory.GetFiles(d2, "local_*.json"))
                             {
-                                if (key == null) continue;
-                                Dictionary<string, object> prev;
-                                if (!outp.TryGetValue(key, out prev) || (Dbl(Get(d, "lastActivityAt")) ?? 0) > (Dbl(Get(prev, "lastActivityAt")) ?? 0))
-                                    outp[key] = d;
+                                seenPaths.Add(path);
+                                var d = CachedRecord(path, Path.GetFileName(d2), usual.ContainsKey(root) ? usual[root] : Path.GetDirectoryName(root));
+                                if (d == null) continue;
+                                foreach (var key in new[] { Str(d, "cliSessionId"), Str(d, "lastAssistantCliSessionId") })
+                                {
+                                    if (key == null) continue;
+                                    Dictionary<string, object> prev;
+                                    if (!outp.TryGetValue(key, out prev) || (Dbl(Get(d, "lastActivityAt")) ?? 0) > (Dbl(Get(prev, "lastActivityAt")) ?? 0))
+                                        outp[key] = d;
+                                }
                             }
-                        }
+                }
+                catch { }
             }
-            catch { }
+            foreach (var k in recCache.Keys.Where(k => !seenPaths.Contains(k)).ToList()) recCache.Remove(k);
         }
         return outp;
     }
 
-    class Analysis { public double? LastTs, ResetAt, Ctx; public string LastKind, LimitKind, Title, Org, Model; }
+    // The app's record files are large (mostly tool lists) and there are hundreds of them; only the few
+    // that changed since the last refresh are read again, and only the fields used here are kept.
+    class RecEntry { public long Size; public DateTime Mtime; public Dictionary<string, object> D; }
+    static readonly Dictionary<string, RecEntry> recCache = new Dictionary<string, RecEntry>();
+    static readonly string[] RecKeys = { "sessionId", "cliSessionId", "lastAssistantCliSessionId", "cwd", "title", "isArchived",
+        "lastActivityAt", "lastFocusedAt", "lastTurnEdgeAt", "postTurnSummary" };
+    static Dictionary<string, object> CachedRecord(string path, string org, string root)
+    {
+        FileInfo fi;
+        try { fi = new FileInfo(path); if (!fi.Exists) return null; } catch { return null; }
+        RecEntry e;
+        if (recCache.TryGetValue(path, out e) && e.Size == fi.Length && e.Mtime == fi.LastWriteTimeUtc) return e.D;
+        var full = ReadJson(path);
+        if (full == null) return null;   // maybe caught mid-write: try again next time
+        var slim = new Dictionary<string, object>();
+        foreach (var k in RecKeys) { object v; if (full.TryGetValue(k, out v)) slim[k] = v; }
+        slim["_org"] = org;
+        slim["_root"] = root;
+        recCache[path] = new RecEntry { Size = fi.Length, Mtime = fi.LastWriteTimeUtc, D = slim };
+        return slim;
+    }
+
+    // ---------- idle helpers ----------
+    // Every open conversation keeps a background Claude process (~100 MB) until the app quits, even
+    // when nothing has happened in it for days. Once a minute, close the ones idle past the panel's
+    // hide time: not working, not waiting on a permission, not pinned, not just looked at.
+    static DateTime idleCheckedAt;
+    static void CloseIdleHelpers(Dictionary<string, Dictionary<string, object>> live, Marks marks, AccountSettings settings)
+    {
+        if (!settings.closeIdleHelpers || (DateTime.UtcNow - idleCheckedAt).TotalSeconds < 60) return;
+        idleCheckedAt = DateTime.UtcNow;
+        double nowMs = Now() * 1000, limitMs = Math.Max(15, settings.hideAfterMinutes) * 60000.0;
+        foreach (var info in live.Values)
+        {
+            try
+            {
+                if (!Truthy(Get(info, "alive")) || Str(info, "status") != "idle") continue;
+                var sid = Str(info, "sessionId");
+                if (sid == null || marks.IsPinned(sid)) continue;
+                double last = Math.Max(Dbl(Get(info, "updatedAt")) ?? 0, Dbl(Get(info, "statusUpdatedAt")) ?? 0);
+                double seen; lock (SeenLock) { LoadSeen(); if (seenAt.TryGetValue(sid, out seen)) last = Math.Max(last, seen); }
+                if (last <= 0 || nowMs - last < limitMs) continue;
+                int pid = (int)(Dbl(Get(info, "pid")) ?? 0);
+                if (pid <= 0) continue;
+                using (var p = Process.GetProcessById(pid))
+                {
+                    // Make sure the number still belongs to that same helper, not a newer process.
+                    if (!string.Equals(p.ProcessName, "claude", StringComparison.OrdinalIgnoreCase)) continue;
+                    var started = Str(info, "procStart");
+                    if (started != null && p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() != started) continue;
+                    p.Kill();
+                }
+            }
+            catch { }
+        }
+    }
+
+    // ---------- seen ----------
+    // The app only notes that you looked at a conversation when you switch to it, so one you were
+    // already watching when it finished stays "new". Fill that in here: in each account, the
+    // conversation focused last is the one on screen, and while that account's window is in front
+    // it counts as seen. Opening a conversation from the panel counts too. Times are milliseconds.
+    static string SeenFile { get { return Path.Combine(Accounts.TrackerDir, "seen.json"); } }
+    static readonly object SeenLock = new object();
+    static Dictionary<string, double> seenAt;
+    static bool seenDirty;
+
+    static void LoadSeen()
+    {
+        if (seenAt != null) return;
+        seenAt = new Dictionary<string, double>();
+        var d = ReadJson(SeenFile);
+        if (d != null) foreach (var kv in d) { var v = Dbl(kv.Value); if (v != null) seenAt[kv.Key] = v.Value; }
+    }
+    static void SaveSeen()
+    {
+        if (!seenDirty) return;
+        double keepFrom = Now() * 1000 - ScanWindow * 1000;
+        foreach (var k in seenAt.Where(kv => kv.Value < keepFrom).Select(kv => kv.Key).ToList()) seenAt.Remove(k);
+        try
+        {
+            var tmp = SeenFile + ".tmp";
+            File.WriteAllText(tmp, Json.Serialize(seenAt));
+            if (File.Exists(SeenFile)) File.Replace(tmp, SeenFile, null); else File.Move(tmp, SeenFile);
+            seenDirty = false;
+        }
+        catch { }
+    }
+    public static void MarkSeen(string sid)
+    {
+        if (sid == null) return;
+        lock (SeenLock) { LoadSeen(); seenAt[sid] = Now() * 1000; seenDirty = true; SaveSeen(); }
+    }
+    static double LastSeen(Dictionary<string, object> rec, string sid)
+    {
+        double t = Dbl(Get(rec, "lastFocusedAt")) ?? 0, s;
+        lock (SeenLock)
+        {
+            LoadSeen();
+            foreach (var k in new[] { sid, Str(rec, "cliSessionId"), Str(rec, "lastAssistantCliSessionId") })
+                if (k != null && seenAt.TryGetValue(k, out s) && s > t) t = s;
+        }
+        return t;
+    }
+
+    // The conversation each account's window shows (the one focused last there), by transcript id;
+    // OnScreenFront is the one in the window that is in front, if a Claude window is.
+    public static volatile HashSet<string> OnScreen = new HashSet<string>(), OnScreenFront = new HashSet<string>();
+
+    static void NoteOnScreen(Dictionary<string, Dictionary<string, object>> recs)
+    {
+        var root = ForegroundRoot();
+        var tops = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rec in recs.Values)
+        {
+            var rr = Str(rec, "_root"); if (rr == null || Truthy(Get(rec, "isArchived"))) continue;
+            Dictionary<string, object> cur;
+            if (!tops.TryGetValue(rr, out cur) || (Dbl(Get(rec, "lastFocusedAt")) ?? 0) > (Dbl(Get(cur, "lastFocusedAt")) ?? 0)) tops[rr] = rec;
+        }
+        var on = new HashSet<string>(); var front = new HashSet<string>();
+        foreach (var kv in tops)
+            foreach (var k in new[] { Str(kv.Value, "cliSessionId"), Str(kv.Value, "lastAssistantCliSessionId") })
+                if (k != null) { on.Add(k); if (root != null && string.Equals(kv.Key, root, StringComparison.OrdinalIgnoreCase)) front.Add(k); }
+        OnScreen = on; OnScreenFront = front;
+        if (root == null) return;
+        Dictionary<string, object> top = null;
+        foreach (var rec in recs.Values)
+            if (string.Equals(Str(rec, "_root"), root, StringComparison.OrdinalIgnoreCase)
+                && (top == null || (Dbl(Get(rec, "lastFocusedAt")) ?? 0) > (Dbl(Get(top, "lastFocusedAt")) ?? 0)))
+                top = rec;
+        if (top == null) return;
+        double now = Now() * 1000;
+        lock (SeenLock)
+        {
+            LoadSeen();
+            foreach (var k in new[] { Str(top, "cliSessionId"), Str(top, "lastAssistantCliSessionId") })
+                if (k != null) { seenAt[k] = now; seenDirty = true; }
+            // Write at most once a minute while you sit on a conversation.
+            if (seenDirty && (DateTime.UtcNow - seenSavedAt).TotalSeconds > 60) { SaveSeen(); seenSavedAt = DateTime.UtcNow; }
+        }
+    }
+    static DateTime seenSavedAt;
+
+    // Which account's Claude window is in front (its account folder), or null. The answer is kept
+    // per window process, so the slow process lookup runs only when the front window changes.
+    static int fgPid = -1; static string fgRoot;
+    static string ForegroundRoot()
+    {
+        uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+        if (pid == 0) return null;
+        if ((int)pid == fgPid) return fgRoot;
+        string root = null;
+        try
+        {
+            using (var q = new System.Management.ManagementObjectSearcher("SELECT Name, CommandLine FROM Win32_Process WHERE ProcessId = " + pid))
+                foreach (System.Management.ManagementObject o in q.Get())
+                    using (o)
+                    {
+                        if (!string.Equals(o["Name"] as string, "claude.exe", StringComparison.OrdinalIgnoreCase)) continue;
+                        var cmd = o["CommandLine"] as string ?? "";
+                        var profs = Profiles();
+                        var p = profs.FirstOrDefault(x => x.N != 1 && cmd.IndexOf(x.Root, StringComparison.OrdinalIgnoreCase) >= 0);
+                        if (p == null && cmd.IndexOf("--user-data-dir", StringComparison.OrdinalIgnoreCase) < 0)
+                        {
+                            var ones = profs.Where(x => x.N == 1).ToList();
+                            if (ones.Count == 1) p = ones[0];
+                        }
+                        if (p != null) root = p.Root;
+                    }
+        }
+        catch { }
+        fgPid = (int)pid; fgRoot = root;
+        return root;
+    }
+
+    class Analysis { public double? LastTs, ResetAt, Ctx; public string LastKind, LimitKind, Title, Org, Model; public bool KeepClock; }
 
     static Analysis Analyse(string path, FileFacts f)
     {
         if (f.A != null) return f.A;
         var a = new Analysis();
         var lines = TailLines(path, TailBytes);
+        // A chat the panel opened only to start an account's 5-hour clock is small and carries a marker.
+        a.KeepClock = f.Size < 128 * 1024 && lines.Any(l => l.Contains(ClaudeTray.KeepClockMarker));
         for (int i = lines.Count - 1; i >= 0; i--)
         {
             var line = lines[i];
@@ -369,9 +562,11 @@ static class Data
         double now = Now();
         var live = LiveSessions();
         var recs = AppRecords();
+        NoteOnScreen(recs);
         var profs = Profiles();
         var marks = Marks.Load();
         var settings = Accounts.Load();
+        CloseIdleHelpers(live, marks, settings);
         double ActiveWindow = Math.Max(5, settings.hideAfterMinutes) * 60.0;
         double scanFor = Math.Max(ScanWindow, ActiveWindow + 86400);
 
@@ -431,7 +626,7 @@ static class Data
         {
             var info = r.Info ?? new Dictionary<string, object>();
             Dictionary<string, object> rec; recs.TryGetValue(r.Sid, out rec);
-            if (Truthy(Get(rec, "isArchived"))) continue;
+            if (Truthy(Get(rec, "isArchived")) || r.A.KeepClock) continue;
             bool alive = Truthy(Get(info, "alive"));
             bool busy = alive && Str(info, "status") == "busy";
             double last = r.A.LastTs ?? r.Mtime;
@@ -448,12 +643,12 @@ static class Data
             if (cat == null) continue;
 
             var summary = Obj(rec, "postTurnSummary");
-            if (stateCat == "waiting" && rec != null && (Dbl(Get(rec, "lastFocusedAt")) ?? 0) < (Dbl(Get(rec, "lastTurnEdgeAt")) ?? 0))
+            if (stateCat == "waiting" && rec != null && LastSeen(rec, r.Sid) < (Dbl(Get(rec, "lastTurnEdgeAt")) ?? 0))
             {
                 stateCat = "unseen";
                 if (cat != "pinned") cat = "unseen";
             }
-            string title = Or(Str(rec, "title"), Str(info, "name"), r.A.Title, TitleFromFile(r.Path, r.F)) ?? "Untitled conversation";
+            string title = Or(Str(rec, "title"), Str(info, "name"), r.A.Title) ?? TitleFromFile(r.Path, r.F) ?? "Untitled conversation";
             string host = Or(Str(rec, "sessionId"), Str(info, "hostSessionId"));
             string cwd = Or(Str(rec, "cwd"), Str(info, "cwd"));
             string note = r.A.LastKind == "error" ? "stopped on an error" : r.A.LastKind == "limit" ? (r.A.LimitKind == "seven_day" ? "hit the weekly limit" : "hit a limit") : null;
@@ -763,6 +958,7 @@ static class Data
 
     public static bool OpenConversation(string sid)
     {
+        MarkSeen(sid);
         KeyValuePair<string, string> known;
         if (openIndex.TryGetValue(sid, out known))
         {
@@ -805,7 +1001,7 @@ static class Data
         var fi = new FileInfo(path);
         var f = FactsFor(path, fi);
         var a = Analyse(path, f);
-        string title = Or(Str(rec, "title"), Str(info, "name"), a.Title, TitleFromFile(path, f)) ?? "Untitled conversation";
+        string title = Or(Str(rec, "title"), Str(info, "name"), a.Title) ?? TitleFromFile(path, f) ?? "Untitled conversation";
         cwd = Or(Str(rec, "cwd"), Str(info, "cwd")) ?? "";
 
         // The last few things said, so the new chat sees where it stopped without opening the file.
