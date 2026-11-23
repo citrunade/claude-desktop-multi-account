@@ -469,10 +469,18 @@ static class ClaudeTray
             File.WriteAllText(Path.Combine(dir, sid + ".md"), text);
         }
         catch { }
-        string folder = cwd;
+        // A chat with no project folder runs in a temporary folder made just for it (deleted with it).
+        // Carrying that over makes Claude ask "Trust this workspace?" for a folder nobody chose, so the
+        // new chat gets its own temporary folder instead.
+        string folder = Data.IsTempWorkspace(cwd) ? null : cwd;
+        // Never press Enter for you while Claude may be asking whether to trust the folder: that answer is yours.
+        bool askTrust = folder != null && !Data.IsTrustedFolder(folder);
+        if (askTrust) send = false;
         Act(() =>
         {
             bool ok = Data.StartConversation(n, text, folder);
+            if (ok && askTrust)
+                try { panel.BeginInvoke((Action)(() => tray.ShowBalloonTip(8000, "Check the new chat", "Claude is asking whether to trust " + folder + ". Answer it, then press Enter to send the hand-off.", ToolTipIcon.Info))); } catch { }
             if (ok && send)
                 AutoSend.Run(n, panel, sent =>
                 {
@@ -894,11 +902,15 @@ class Panel : Form
     // (not over a full-screen app).
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
-    int pillTicks;
+    int pillTicks; IntPtr pillFg;
     void KeepPillOnTaskbar()
     {
-        if (bar == null || !bar.Visible || dragging || ++pillTicks % 8 != 0) return;
+        if (bar == null || !bar.Visible || dragging) return;
+        // Clicking the taskbar (to switch Claude windows) puts it over the bar: lift the bar back the
+        // moment the front window changes, not up to a third of a second later, so it doesn't blink.
         var fg = GetForegroundWindow(); RECT fr;
+        bool changed = fg != pillFg; pillFg = fg;
+        if (++pillTicks % 8 != 0 && !changed) return;
         var sb = Screen.PrimaryScreen.Bounds;
         if (fg != IntPtr.Zero && fg != Handle && GetWindowRect(fg, out fr) && fr.L <= sb.Left && fr.T <= sb.Top && fr.R >= sb.Right && fr.B >= sb.Bottom) return;
         var pr = PillRect();

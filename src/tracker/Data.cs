@@ -983,6 +983,33 @@ static class Data
         return OpenInAccount(p, "claude://code/new" + (q.Count > 0 ? "?" + string.Join("&", q) : ""));
     }
 
+    // The temporary folder Claude makes for a chat started without a project folder.
+    public static bool IsTempWorkspace(string folder)
+    {
+        return !string.IsNullOrEmpty(folder) && folder.Replace('/', '\\').IndexOf("\\scratch-workspaces\\", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    // Whether "Trust this workspace?" was already answered yes for this folder (or a folder above it).
+    // Unknown counts as not trusted.
+    public static bool IsTrustedFolder(string folder)
+    {
+        try
+        {
+            var cfg = ReadJson(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude.json"));
+            var projects = Get(cfg, "projects") as Dictionary<string, object>;
+            if (projects == null) return false;
+            Func<string, string> Norm = s => s.Replace('/', '\\').TrimEnd('\\').ToLowerInvariant();
+            var want = Norm(Path.GetFullPath(folder));
+            foreach (var kv in projects)
+            {
+                var k = Norm(kv.Key);
+                if ((want == k || want.StartsWith(k + "\\")) && Truthy(Get(kv.Value as Dictionary<string, object>, "hasTrustDialogAccepted"))) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
     // ---------- hand off ----------
     static readonly Regex NoteTags = new Regex(@"<(system-reminder|local-command[a-z-]*|command-[a-z-]+)>.*?</\1>", RegexOptions.Singleline);
 

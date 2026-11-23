@@ -84,7 +84,11 @@ static class AutoSend
         if (code >= 0)
         {
             IntPtr extra = Marshal.ReadIntPtr(l, 16);
-            if (extra != Mine) return (IntPtr)1;   // anyone else's key: hold it
+            // Let key releases through: swallowing one leaves that key stuck down for Windows
+            // (a held-in Alt is what stops Alt+Tab working afterwards).
+            int msg = (int)w;
+            bool release = msg == 0x101 /* WM_KEYUP */ || msg == 0x105 /* WM_SYSKEYUP */;
+            if (extra != Mine && !release) return (IntPtr)1;   // anyone else's key press: hold it
         }
         return CallNextHookEx(IntPtr.Zero, code, w, l);
     }
