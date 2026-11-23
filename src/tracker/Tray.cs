@@ -99,12 +99,16 @@ static class ClaudeTray
         if (args.Length > 2 && args[0] == "--render-panel")   // for pictures: draws the panel from saved data (JSON) to a picture
         {
             State = (Dictionary<string, object>)new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(File.ReadAllText(args[1]));
+            // Sample conversations shown as open in their account's window (and the one in front).
+            Func<string, HashSet<string>> ids = key => { var h = new HashSet<string>(); object v; if (State.TryGetValue(key, out v) && v is object[]) foreach (var o in (object[])v) h.Add((string)o); return h; };
+            Data.OnScreen = ids("onScreen"); Data.OnScreenFront = ids("onScreenFront");
             panel = new Panel { Location = new Point(-5000, -5000) };
             if (args.Length > 4) panel.Size = new Size(int.Parse(args[3]), int.Parse(args[4]));
             panel.Show(); Application.DoEvents();
             // Off screen nothing paints, and the board only grows to fit while painting: paint it once to a throwaway picture.
             for (int k = 0; k < 2; k++) using (var tmp = new Bitmap(Math.Max(1, panel.Board.Width), Math.Max(1, panel.Board.Height))) { panel.Board.DrawToBitmap(tmp, new Rectangle(0, 0, tmp.Width, tmp.Height)); Application.DoEvents(); }
             using (var b = new Bitmap(panel.Width, panel.Height)) { panel.DrawToBitmap(b, new Rectangle(0, 0, panel.Width, panel.Height)); b.Save(args[2]); }
+            if (args.Length > 5) panel.RenderBar(args[5]);   // and the bar on the taskbar
             return;
         }
         if (args.Length > 0 && args[0] == "--manage") { Application.Run(new ManageForm()); return; }
@@ -696,6 +700,19 @@ class Panel : Form
     DateTime flashUntil = DateTime.MinValue;
     public void FlashNew() { flashUntil = DateTime.UtcNow.AddSeconds(4); }
 
+    // For pictures: the bar on the taskbar, drawn to a file.
+    public void RenderBar(string path)
+    {
+        var sz = PillSize;
+        using (var b = new Bitmap(sz.Width, sz.Height))
+        using (var g = Graphics.FromImage(b))
+        {
+            g.Clear(Ui.Bg);
+            PaintBar(g, sz.Width, sz.Height);
+            using (var pen = new Pen(Ui.Line)) g.DrawRectangle(pen, 0, 0, sz.Width - 1, sz.Height - 1);
+            b.Save(path);
+        }
+    }
     // Draws the bar on the taskbar (its own window, see BarWindow).
     public void PaintBar(Graphics g, int w, int h)
     {

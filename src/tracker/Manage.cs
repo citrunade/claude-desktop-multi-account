@@ -44,6 +44,19 @@ class ManageForm : Form
         try { DwmSetWindowAttribute(Handle, 35, ref caption, 4); } catch { }
         try { DwmSetWindowAttribute(Handle, 36, ref text, 4); } catch { }
         try { DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { }
+        // Stay hidden until the window is fully drawn, so it doesn't flash white first.
+        int cloak = 1;
+        try { DwmSetWindowAttribute(Handle, 13 /* DWMWA_CLOAK */, ref cloak, 4); } catch { }
+    }
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")] static extern int DwmFlush();
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        Refresh();
+        try { DwmFlush(); } catch { }
+        int cloak = 0;
+        try { DwmSetWindowAttribute(Handle, 13, ref cloak, 4); } catch { }
     }
 
     public ManageForm()
