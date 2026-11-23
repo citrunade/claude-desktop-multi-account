@@ -1533,6 +1533,7 @@ class Board : DoubleBufferedControl
     int RowHeight(Dictionary<string, object> it, string key)
     {
         string k = key == "pinned" ? (it["state"] as string ?? "idle") : key;
+        if (k == "background") k = "working";
         return P(k != "working" && it["detail"] != null ? 52 : 38);
     }
 
@@ -1674,12 +1675,17 @@ class Board : DoubleBufferedControl
             hits.Add(new KeyValuePair<Rectangle, Action>(r, () => { if (osid != null) ClaudeTray.OpenConversation(osid); else ClaudeTray.Open(link); }));
         }
         string realKey = key == "pinned" ? (it["state"] as string ?? "idle") : key;
+        // Answered, with a job of its own still running in the background: a steady blue dot.
+        bool background = it["state"] as string == "background";
+        if (realKey == "background") realKey = "working";
         bool rowHover = r.Contains(mouse);
         string sid = it.ContainsKey("sessionId") ? it["sessionId"] as string : null;
         // dot
         int dx = x + P(9), dy = y + P(11);
         var dotR = new RectangleF(dx, dy, P(7), P(7));
         if (realKey == "idle") using (var pen = new Pen(Ui.Faint, 1.5f * owner.S)) g.DrawEllipse(pen, dotR);
+        else if (realKey == "working" && background)
+            using (var b = new SolidBrush(Ui.Blue)) g.FillEllipse(b, dotR);
         else if (realKey == "working")
         {
             int alpha = (int)(155 + 100 * Math.Abs(Math.Sin(Ui.Now() * 2.2)));

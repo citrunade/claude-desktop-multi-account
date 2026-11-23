@@ -343,7 +343,7 @@ static class Data
     // when nothing has happened in it for days. Once a minute, close the ones idle past the panel's
     // hide time: not working, not waiting on a permission, not pinned, not just looked at.
     static DateTime idleCheckedAt;
-    static void CloseIdleHelpers(Dictionary<string, Dictionary<string, object>> live, Marks marks, AccountSettings settings)
+    static void CloseIdleHelpers(Dictionary<string, Dictionary<string, object>> live, Marks marks, AccountSettings settings, HashSet<string> withJobs)
     {
         if (!settings.closeIdleHelpers || (DateTime.UtcNow - idleCheckedAt).TotalSeconds < 60) return;
         idleCheckedAt = DateTime.UtcNow;
@@ -354,7 +354,7 @@ static class Data
             {
                 if (!Truthy(Get(info, "alive")) || Str(info, "status") != "idle") continue;
                 var sid = Str(info, "sessionId");
-                if (sid == null || marks.IsPinned(sid)) continue;
+                if (sid == null || marks.IsPinned(sid) || withJobs.Contains(sid)) continue;
                 double last = Math.Max(Dbl(Get(info, "updatedAt")) ?? 0, Dbl(Get(info, "statusUpdatedAt")) ?? 0);
                 double seen; lock (SeenLock) { LoadSeen(); if (seenAt.TryGetValue(sid, out seen)) last = Math.Max(last, seen); }
                 if (last <= 0 || nowMs - last < limitMs) continue;
@@ -491,7 +491,94 @@ static class Data
         return root;
     }
 
-    class Analysis { public double? LastTs, ResetAt, Ctx; public string LastKind, LimitKind, Title, Org, Model; public bool KeepClock; }
+    class Analysis { public double? LastTs, ResetAt, Ctx; public string LastKind, LimitKind, Title, Org, Model; public bool KeepClock; public List<Job> Jobs; }
+
+    // ---------- background jobs ----------
+    // A conversation can answer and end its turn while something it started keeps going (a command
+    // run in the background, a helper agent, a watcher). Claude then calls it idle, but it will wake
+    // up by itself when the job ends. The transcript says when each job starts and when it ends.
+    class Job { public string Id, Kind; public double Ts; public double? Expires; }
+    static readonly Regex JobStop = new Regex("\"name\":\"TaskStop\",\"input\":\\{\"task_id\":\"([a-z0-9]+)\"");
+    // Starts are read only from the structured result Claude saves with the tool call, never from
+    // text: a command's printed output can contain the very same words.
+    static readonly Regex JobEnd = new Regex("\"(?:content|prompt)\":\"<task-notification>\\\\n<task-id>([a-z0-9]+)</task-id>(?:[^\"\\\\]|\\\\.)*?<status>[a-z]+</status>");
+
+    static List<Job> FindJobs(List<string> lines)
+    {
+        var open = new Dictionary<string, Job>();
+        foreach (var line in lines)
+        {
+            if (!line.StartsWith("{")) continue;
+            if (line.Contains("<task-notification>"))
+                foreach (Match m in JobEnd.Matches(line)) open.Remove(m.Groups[1].Value);
+            if (line.Contains("\"TaskStop\"") && line.Contains("\"type\":\"assistant\""))
+                foreach (Match m in JobStop.Matches(line)) open.Remove(m.Groups[1].Value);
+            if (!line.Contains("\"toolUseResult\"") || !line.Contains("\"type\":\"user\"")) continue;
+            if (!line.Contains("\"backgroundTaskId\"") && !line.Contains("\"async_launched\"") && !line.Contains("\"timeoutMs\"")) continue;
+            Dictionary<string, object> e;
+            try { e = Json.DeserializeObject(line) as Dictionary<string, object>; } catch { continue; }
+            if (e == null || Str(e, "type") != "user" || Truthy(Get(e, "isSidechain"))) continue;
+            var r = Obj(e, "toolUseResult");
+            if (r == null) continue;
+            double ts = IsoToTs(Get(e, "timestamp")) ?? 0;
+            string id = null, kind = null; double? expires = null;
+            if (Str(r, "backgroundTaskId") != null) { id = Str(r, "backgroundTaskId"); kind = "shell"; }
+            else if (Str(r, "status") == "async_launched" && Str(r, "agentId") != null)
+            {
+                // A helper agent; one that never reports back stops counting after two hours.
+                id = Str(r, "agentId"); kind = "agent"; expires = ts + 2 * 3600;
+            }
+            else if (Str(r, "taskId") != null && Dbl(Get(r, "timeoutMs")) != null)
+            {
+                id = Str(r, "taskId"); kind = "watch";
+                if (!Truthy(Get(r, "persistent"))) expires = ts + Dbl(Get(r, "timeoutMs")).Value / 1000 + 30;
+            }
+            if (id != null && !open.ContainsKey(id)) open[id] = new Job { Id = id, Kind = kind, Ts = ts, Expires = expires };
+        }
+        return open.Values.ToList();
+    }
+
+    // Jobs still running: started by the Claude process that is alive now (a restart kills the old
+    // ones without a word), not ended, and for a watcher not past its expiry.
+    // The end of a background command isn't always written down, so one only counts while that
+    // Claude process still has a command window (a shell) running under it.
+    static int RunningJobs(Analysis a, Dictionary<string, object> info, double now)
+    {
+        if (a.Jobs == null || a.Jobs.Count == 0 || !Truthy(Get(info, "alive"))) return 0;
+        double started = (Dbl(Get(info, "startedAt")) ?? 0) / 1000;
+        var live = a.Jobs.Where(j => j.Ts >= started - 5 && (j.Expires == null || j.Expires > now)).ToList();
+        if (live.Any(j => j.Kind == "shell") && !HasShellChild((int)(Dbl(Get(info, "pid")) ?? 0)))
+            live.RemoveAll(j => j.Kind == "shell");
+        return live.Count;
+    }
+
+    static readonly HashSet<string> ShellNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "bash.exe", "sh.exe", "powershell.exe", "pwsh.exe", "cmd.exe" };
+    static Dictionary<int, List<string>> childNames = new Dictionary<int, List<string>>();
+    static DateTime childrenAt;
+    static bool HasShellChild(int pid)
+    {
+        if (pid <= 0) return false;
+        // One look at the process list every few seconds, and only when some chat needs it.
+        if ((DateTime.UtcNow - childrenAt).TotalSeconds > 4)
+        {
+            var map = new Dictionary<int, List<string>>();
+            try
+            {
+                using (var q = new System.Management.ManagementObjectSearcher("SELECT ParentProcessId, Name FROM Win32_Process"))
+                    foreach (System.Management.ManagementObject o in q.Get())
+                        using (o)
+                        {
+                            int parent = Convert.ToInt32(o["ParentProcessId"]);
+                            List<string> l; if (!map.TryGetValue(parent, out l)) map[parent] = l = new List<string>();
+                            l.Add(o["Name"] as string ?? "");
+                        }
+            }
+            catch { }
+            childNames = map; childrenAt = DateTime.UtcNow;
+        }
+        List<string> kids;
+        return childNames.TryGetValue(pid, out kids) && kids.Any(n => ShellNames.Contains(n));
+    }
 
     static Analysis Analyse(string path, FileFacts f)
     {
@@ -546,6 +633,7 @@ static class Data
             if (a.LastKind != null && a.LastTs != null && a.Title != null && a.Ctx != null) break;
         }
         if (a.LastKind == "limit") a.Org = OrgFromFile(path, f);
+        a.Jobs = FindJobs(lines);
         f.A = a;
         return a;
     }
@@ -566,7 +654,6 @@ static class Data
         var profs = Profiles();
         var marks = Marks.Load();
         var settings = Accounts.Load();
-        CloseIdleHelpers(live, marks, settings);
         double ActiveWindow = Math.Max(5, settings.hideAfterMinutes) * 60.0;
         double scanFor = Math.Max(ScanWindow, ActiveWindow + 86400);
 
@@ -595,6 +682,8 @@ static class Data
                     rows.Add(new Row { Sid = sid, Path = path, Mtime = mtime, Info = info, F = f, A = Analyse(path, f) });
                 }
         foreach (var k in facts.Keys.Where(k => !seen.Contains(k)).ToList()) facts.Remove(k);
+        // Closing an idle helper would kill a job it still has running in the background.
+        CloseIdleHelpers(live, marks, settings, new HashSet<string>(rows.Where(r => r.Info != null && RunningJobs(r.A, r.Info, now) > 0).Select(r => r.Sid)));
 
         Func<Row, string> orgOf = r =>
         {
@@ -629,16 +718,18 @@ static class Data
             if (Truthy(Get(rec, "isArchived")) || r.A.KeepClock) continue;
             bool alive = Truthy(Get(info, "alive"));
             bool busy = alive && Str(info, "status") == "busy";
+            bool background = !busy && RunningJobs(r.A, info, now) > 0;
             double last = r.A.LastTs ?? r.Mtime;
             string cat = null;
-            if (busy) cat = "working";
+            if (busy || background) cat = "working";
             else if (five.Contains(r) && r.A.ResetAt == latestReset) cat = "cut";
             else if (now - last < ActiveWindow && (r.A.LastKind == "assistant" || r.A.LastKind == "error" || r.A.LastKind == "limit")) cat = "waiting";
 
             // Finished stays hidden until the conversation gets new activity after it was finished.
             double finished = marks.FinishedAt(r.Sid);
             if (finished > 0 && last <= finished + 5 && cat != "working") continue;
-            string stateCat = cat;
+            // Answered, but a job it started is still running: listed with working, drawn differently.
+            string stateCat = background ? "background" : cat;
             if (marks.IsPinned(r.Sid)) cat = "pinned";
             if (cat == null) continue;
 
