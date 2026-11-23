@@ -43,6 +43,22 @@ class BarWindow : Form
         base.OnHandleCreated(e);
         int round = 3;   // small rounded corners
         try { DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { }
+        Own();
+    }
+
+    // The bar belongs to the taskbar window, so whenever the taskbar comes to the front (you clicked
+    // it to switch windows) Windows brings the bar along in the same step: it never shows behind it,
+    // not even for a moment. It also drops behind a full-screen app together with the taskbar.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
+    const int GWLP_HWNDPARENT = -8;
+    public void Own()
+    {
+        if (!IsHandleCreated) return;
+        var tb = FindWindow("Shell_TrayWnd", null);   // a new one after Explorer restarts
+        if (tb != IntPtr.Zero && GetWindowLongPtr(Handle, GWLP_HWNDPARENT) != tb)
+            SetWindowLongPtr(Handle, GWLP_HWNDPARENT, tb);
     }
 
     protected override void OnPaint(PaintEventArgs e)

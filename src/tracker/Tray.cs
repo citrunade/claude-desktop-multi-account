@@ -905,7 +905,14 @@ class Panel : Form
     int pillTicks; IntPtr pillFg;
     void KeepPillOnTaskbar()
     {
-        if (bar == null || !bar.Visible || dragging) return;
+        if (bar != null && bar.IsDisposed && Visible)
+        {
+            // Explorer restarting can take the bar down with the taskbar it belongs to: make a new one.
+            bar = new BarWindow(this);
+            bar.Bounds = PillRect(); bar.Show();
+        }
+        if (bar == null || bar.IsDisposed || !bar.Visible || dragging) return;
+        if (pillTicks % 8 == 0) bar.Own();
         // Clicking the taskbar (to switch Claude windows) puts it over the bar: lift the bar back the
         // moment the front window changes, not up to a third of a second later, so it doesn't blink.
         var fg = GetForegroundWindow(); RECT fr;
