@@ -153,6 +153,10 @@ static class ClaudeTray
 
             Fetch();
             ShowPanel();
+            // "Open all accounts when Windows starts": only right after sign-in, not when you restart the widget.
+            var al = Accounts.Load().autoLaunchAccounts;
+            if (al != null && al.Count > 0 && Environment.TickCount >= 0 && Environment.TickCount < 15 * 60 * 1000)
+                ThreadPool.QueueUserWorkItem(_ => { Thread.Sleep(3000); Data.AutoLaunchAll(); });
             Application.Run();
         }
     }
@@ -475,6 +479,7 @@ static class ClaudeTray
         });
     }
     public static void StartAccount(int n) { Act(() => Data.StartConversation(n), "Couldn't open that account."); }
+    public static void LaunchAccount(int n) { Act(() => Data.LaunchAccount(n), "Couldn't open that account."); }
     public static void OpenConversation(string sid) { Act(() => Data.OpenConversation(sid), "Couldn't find that conversation in Claude."); }
     public static void Mark(string sid, string action) { Act(() => Marks.Set(sid, action), null); }
     public static void Handoff(string sid, int n, bool send = false, string doneTitle = null)
@@ -902,6 +907,14 @@ class Panel : Form
     Rectangle TaskbarStrip()
     {
         var sc = Screen.PrimaryScreen; var b = sc.Bounds; var wa = sc.WorkingArea;
+        // Ask the taskbar itself where it is first: after a game changes the resolution, the screen's
+        // remembered work area can be out of date and the bar would land off the taskbar.
+        var tw = FindWindow("Shell_TrayWnd", null); RECT tr;
+        if (tw != IntPtr.Zero && IsWindowVisible(tw) && GetWindowRect(tw, out tr))
+        {
+            var t = new Rectangle(tr.L, tr.T, tr.R - tr.L, tr.B - tr.T);
+            if (t.Width > t.Height && t.Height >= P(20) && t.Height < b.Height / 4 && b.Contains(t)) return t;
+        }
         if (wa.Bottom < b.Bottom) return new Rectangle(b.Left, wa.Bottom, b.Width, b.Bottom - wa.Bottom);
         if (wa.Top > b.Top) return new Rectangle(b.Left, b.Top, b.Width, wa.Top - b.Top);
         return new Rectangle(b.Left, b.Bottom - PillSize.Height - P(4), b.Width, PillSize.Height + P(4));
@@ -925,18 +938,44 @@ class Panel : Form
     // (not over a full-screen app).
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
-    int pillTicks; IntPtr pillFg;
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    int pillTicks; IntPtr pillFg; bool hiddenForFullScreen, hideOverGames;
+    // A game or video filling the whole main screen (not the desktop itself).
+    bool FullScreenInFront(IntPtr fg)
+    {
+        RECT fr; var sb = Screen.PrimaryScreen.Bounds;
+        if (fg == IntPtr.Zero || fg == Handle || (bar != null && fg == bar.Handle)) return false;
+        if (!GetWindowRect(fg, out fr) || fr.L > sb.Left || fr.T > sb.Top || fr.R < sb.Right || fr.B < sb.Bottom) return false;
+        var sb2 = new System.Text.StringBuilder(64); GetClassName(fg, sb2, 64);
+        var cls = sb2.ToString();
+        return cls != "Progman" && cls != "WorkerW" && cls != "Shell_TrayWnd";
+    }
     void KeepPillOnTaskbar()
     {
-        if (bar == null || !bar.Visible || dragging) return;
+        if (bar == null || dragging) return;
+        var fg = GetForegroundWindow();
+        // While a full-screen game is in front, take the bar off the screen entirely so it never
+        // fights the game (or Windows) over the top spot; bring it back once you leave the game.
+        bool full = FullScreenInFront(fg);
+        if (full)
+        {
+            // Either hide it (setting), or leave it exactly where it is: no moving or re-raising
+            // during the game, so it never fights the game or Windows over the top spot.
+            if (hideOverGames && bar.Visible) { bar.Hide(); hiddenForFullScreen = true; }
+            return;
+        }
+        if (hiddenForFullScreen)
+        {
+            hiddenForFullScreen = false;
+            if (Visible) { bar.Bounds = PillRect(); bar.Show(); }
+        }
+        if (!bar.Visible) return;
         // Clicking the taskbar (to switch Claude windows) puts it over the bar: lift the bar back the
         // moment the front window changes or the taskbar is seen in front of it (checked every 40 ms),
         // not up to a third of a second later, so it doesn't blink.
-        var fg = GetForegroundWindow(); RECT fr;
         bool changed = fg != pillFg; pillFg = fg;
         if (++pillTicks % 8 != 0 && !changed && !bar.TaskbarInFront()) return;
-        var sb = Screen.PrimaryScreen.Bounds;
-        if (fg != IntPtr.Zero && fg != Handle && GetWindowRect(fg, out fr) && fr.L <= sb.Left && fr.T <= sb.Top && fr.R >= sb.Right && fr.B >= sb.Bottom) return;
         var pr = PillRect();
         if (bar.Bounds != pr) bar.Bounds = pr;
         SetWindowPos(bar.Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10);   // topmost, no move, no size, no focus
@@ -1028,6 +1067,7 @@ class Panel : Form
         // from one Claude window to another passes through it for a split second.
         bool switched = false;
         if (!mine && !OnTaskbar() && onClaude != ctxClaude) { ctxClaude = onClaude; switched = true; }
+        hideOverGames = s.hideOverGames;
         bool hm = HoverModeFor(s);
         if (hm != hoverMode) { hoverMode = hm; header.Invalidate(); }
         if (ctxClaude != footerCtx) { footerCtx = ctxClaude; footer.Invalidate(); }
@@ -1600,6 +1640,16 @@ class Board : DoubleBufferedControl
             }
             TextRenderer.DrawText(g, "+ New", fSmall, br, canStart ? (hov ? Ui.Text : Ui.Dim) : Ui.Faint, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             if (canStart) { int nn = n; hits.Add(new KeyValuePair<Rectangle, Action>(br, () => { ClaudeTray.StartAccount(nn); })); }
+            // Open: brings up this account's Claude window, starting it if it's closed.
+            var ob = new Rectangle(br.Left - P(62), br.Top, P(56), br.Height);
+            bool ohov = canStart && ob.Contains(mouse);
+            using (var p = Ui.Rounded(ob, P(6)))
+            {
+                if (ohov) using (var b = new SolidBrush(Ui.Hover)) g.FillPath(b, p);
+                using (var pen = new Pen(Ui.Line)) g.DrawPath(pen, p);
+            }
+            TextRenderer.DrawText(g, "Open", fSmall, ob, canStart ? (ohov ? Ui.Text : Ui.Dim) : Ui.Faint, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            if (canStart) { int nn = n; hits.Add(new KeyValuePair<Rectangle, Action>(ob, () => { ClaudeTray.LaunchAccount(nn); })); }
         }
         y += P(26);
 

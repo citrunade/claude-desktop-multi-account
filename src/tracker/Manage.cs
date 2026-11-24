@@ -69,7 +69,13 @@ class ManageForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;   // always above the panel, which is itself always on top
-        ClientSize = new Size(P(620), P(840));
+        ClientSize = new Size(P(620), P(878));
+        // Keep the whole window on screen (Windows can place it so the bottom buttons fall off).
+        Shown += (s, e) =>
+        {
+            var wa = Screen.FromControl(this).WorkingArea;
+            Location = new Point(Math.Max(wa.Left, Math.Min(Left, wa.Right - Width)), Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height)));
+        };
 
         var title = new Label { Text = "Your Claude accounts", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(P(18), P(14)) };
         var hint = new Label
@@ -156,10 +162,17 @@ class ManageForm : Form
         });
         keepCut.Location = new Point(P(270), P(738));
         tip.SetToolTip(keepCut, "Keep every conversation that hit a limit and wasn't continued in a new chat on another account,\nunder \"Cut\" for up to 8 days, even after Claude archives it. It leaves once you hand it off, mark it finished, or carry on in it.");
-        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, cutLabel, keepCut });
+        var launchLabel = new Label { Text = "Over full-screen games", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(782)) };
+        var launch = MakeChoice(new[] { "Keep the bar showing", "Hide the bar" }, s0.hideOverGames ? 1 : 0, P(330), idx =>
+        {
+            var st = Accounts.Load(); st.hideOverGames = idx == 1; Accounts.Save(st);
+        });
+        launch.Location = new Point(P(270), P(776));
+        tip.SetToolTip(launch, "While a game or video fills the whole screen, the taskbar bar either stays where it is\n(it doesn't move or re-raise itself during the game) or is taken away until you leave it.");
+        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, cutLabel, keepCut, launchLabel, launch });
 
         addBtn = MakeButton("+ Add account", P(130));
-        addBtn.Location = new Point(P(18), P(790));
+        addBtn.Location = new Point(P(18), P(828));
         // Adding an account opens it straight away on Claude's sign-in screen.
         addBtn.Click += (s, e) =>
         {
@@ -172,7 +185,7 @@ class ManageForm : Form
                 return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
             });
         };
-        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(788)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(826)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
         Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, byLabel, by, capLabel, capWeek, orLabel, capFive, addBtn, status });
         Reload();
     }
@@ -261,6 +274,21 @@ class ManageForm : Form
         var save = MakeButton("Save", P(70)); save.Location = new Point(P(410), P(8)); save.Enabled = false;
         var remove = MakeButton("Remove", P(70)); remove.Location = new Point(P(488), P(8)); remove.Visible = a.n > 1;
         remove.ForeColor = Ui.Bad;
+        // Open this account by itself right after you sign in to Windows. Saved straight away.
+        var startup = new CheckBox
+        {
+            Text = "Open when Windows starts", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(410), P(38)),
+            Font = new Font("Segoe UI", 8f), Checked = (Accounts.Load().autoLaunchAccounts ?? new List<int>()).Contains(a.n)
+        };
+        startup.CheckedChanged += (s, e) =>
+        {
+            var st = Accounts.Load();
+            if (st.autoLaunchAccounts == null) st.autoLaunchAccounts = new List<int>();
+            st.autoLaunchAccounts.Remove(a.n);
+            if (startup.Checked) st.autoLaunchAccounts.Add(a.n);
+            Accounts.Save(st);
+            status.ForeColor = Ui.Ok; status.Text = Accounts.ShortcutName(a) + (startup.Checked ? " will open when Windows starts." : " won't open by itself.");
+        };
 
         Action refresh = () =>
         {
@@ -307,7 +335,7 @@ class ManageForm : Form
             Run("Removing…", () => { Accounts.Remove(a, signOut); return Accounts.ShortcutName(a) + " removed" + (signOut ? " and signed out." : "; its sign-in is kept."); });
         };
 
-        row.Controls.AddRange(new Control[] { pic, name, num, colour, picture, save, remove });
+        row.Controls.AddRange(new Control[] { pic, name, num, colour, picture, save, remove, startup });
         row.Controls.AddRange(tiles.ToArray());
         refresh();
         return row;

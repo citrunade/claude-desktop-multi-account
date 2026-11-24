@@ -1001,6 +1001,31 @@ static class Data
         return true;
     }
 
+    // Open account n's Claude window (or bring it forward if it's already open), the same way its own
+    // shortcut does. With focus false it only opens accounts that aren't running, in the background.
+    public static bool LaunchAccount(int n, bool focus = true)
+    {
+        var p = Profiles().FirstOrDefault(x => x.N == n && x.CanStart);
+        if (p == null) return false;
+        bool running = MainClaudePid(p) != 0;
+        if (running && !focus) return true;
+        if (p.Launcher != null && File.Exists(p.Launcher)) Run(p.Launcher, null);
+        else if (File.Exists(ClaudeExe)) Run(ClaudeExe, p.N == 1 ? null : "--user-data-dir=" + Quote(p.Root));
+        else return false;
+        if (focus) BringToFront(p);
+        return true;
+    }
+
+    // At sign-in: open each account picked for it that isn't open yet, one after another.
+    public static void AutoLaunchAll()
+    {
+        var pick = Accounts.Load().autoLaunchAccounts ?? new List<int>();
+        foreach (var p in Profiles().Where(x => x.CanStart && pick.Contains(x.N)).OrderBy(x => x.N))
+        {
+            try { if (MainClaudePid(p) == 0) { LaunchAccount(p.N, false); System.Threading.Thread.Sleep(2500); } } catch { }
+        }
+    }
+
     static bool LauncherRunning(string exe)
     {
         try

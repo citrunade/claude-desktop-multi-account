@@ -57,6 +57,10 @@ public class AccountSettings
     // Never hand off to an account that has used this much (percent) of its weekly / 5-hour limit.
     public int handoffMaxWeekly = 90;
     public int handoffMaxFive = 90;
+    // Accounts whose Claude window opens by itself when Windows starts (the widget starts with Windows).
+    public List<int> autoLaunchAccounts = new List<int>();
+    // Take the taskbar bar away while a full-screen game or video is in front (otherwise it stays over it).
+    public bool hideOverGames = false;
 }
 
 static class Accounts
