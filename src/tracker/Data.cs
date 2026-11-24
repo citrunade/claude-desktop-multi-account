@@ -774,7 +774,9 @@ static class Data
 
             // Finished stays hidden until the conversation gets new activity after it was finished.
             double finished = marks.FinishedAt(r.Sid);
-            if (finished > 0 && last <= finished + 5 && cat != "working") continue;
+            // Ticked while still working (or with a job left running): it leaves at once and comes back
+            // only once it has finished a turn after the tick.
+            if (finished > 0 && (cat == "working" || last <= finished + 5)) continue;
             // Handed off: it carries on in the new chat, so it leaves the list like a finished one.
             double handed;
             if (handedOff.TryGetValue(r.Sid, out handed) && last <= handed + 5 && cat != "working" && !marks.IsPinned(r.Sid)) continue;
