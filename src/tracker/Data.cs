@@ -51,13 +51,14 @@ static class Data
     {
         lock (handedOffLock) try { File.AppendAllText(HandedOffFile, sid + Environment.NewLine); } catch { }
     }
-    static HashSet<string> HandedOff()
+    // sessionId -> when it was handed off. Every hand-off leaves its text in handoffs\<id>.md (also
+    // ones from before handed-off.txt existed); the file's time is the hand-off time.
+    static Dictionary<string, double> HandedOff()
     {
-        var outp = new HashSet<string>();
+        var outp = new Dictionary<string, double>();
+        try { foreach (var p in SafeFiles(Path.Combine(ClaudeDir, "handoffs"), "*.md")) outp[Path.GetFileNameWithoutExtension(p)] = ToTs(File.GetLastWriteTimeUtc(p)); } catch { }
         lock (handedOffLock)
-            try { foreach (var s in File.ReadAllLines(HandedOffFile)) if (s.Trim().Length > 0) outp.Add(s.Trim()); } catch { }
-        // Every hand-off also leaves its text in handoffs\<id>.md, including ones from before this list existed.
-        try { foreach (var p in SafeFiles(Path.Combine(ClaudeDir, "handoffs"), "*.md")) outp.Add(Path.GetFileNameWithoutExtension(p)); } catch { }
+            try { foreach (var s in File.ReadAllLines(HandedOffFile)) if (s.Trim().Length > 0 && !outp.ContainsKey(s.Trim())) outp[s.Trim()] = double.MaxValue; } catch { }
         return outp;
     }
 
@@ -84,6 +85,21 @@ static class Data
         uint code; bool ok = GetExitCodeProcess(h, out code);
         CloseHandle(h);
         return ok && code == 259;
+    }
+
+    static string HeadText(string path, int nbytes)
+    {
+        try
+        {
+            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                var buf = new byte[Math.Min((long)nbytes, f.Length)];
+                int read = 0, n;
+                while (read < buf.Length && (n = f.Read(buf, read, buf.Length - read)) > 0) read += n;
+                return Encoding.UTF8.GetString(buf, 0, read);
+            }
+        }
+        catch { return ""; }
     }
 
     static List<string> TailLines(string path, int nbytes)
@@ -360,9 +376,10 @@ static class Data
     // when nothing has happened in it for days. Once a minute, close the ones idle past the panel's
     // hide time: not working, not waiting on a permission, not pinned, not just looked at.
     static DateTime idleCheckedAt;
-    static void CloseIdleHelpers(Dictionary<string, Dictionary<string, object>> live, Marks marks, AccountSettings settings, HashSet<string> withJobs)
+    // A clock-start chat is closed as soon as it has replied, whatever the setting: nobody reads it.
+    static void CloseIdleHelpers(Dictionary<string, Dictionary<string, object>> live, Marks marks, AccountSettings settings, HashSet<string> withJobs, HashSet<string> clockStarts)
     {
-        if (!settings.closeIdleHelpers || (DateTime.UtcNow - idleCheckedAt).TotalSeconds < 60) return;
+        if ((DateTime.UtcNow - idleCheckedAt).TotalSeconds < 60) return;
         idleCheckedAt = DateTime.UtcNow;
         double nowMs = Now() * 1000, limitMs = Math.Max(15, settings.hideAfterMinutes) * 60000.0;
         foreach (var info in live.Values)
@@ -374,7 +391,9 @@ static class Data
                 if (sid == null || marks.IsPinned(sid) || withJobs.Contains(sid)) continue;
                 double last = Math.Max(Dbl(Get(info, "updatedAt")) ?? 0, Dbl(Get(info, "statusUpdatedAt")) ?? 0);
                 double seen; lock (SeenLock) { LoadSeen(); if (seenAt.TryGetValue(sid, out seen)) last = Math.Max(last, seen); }
-                if (last <= 0 || nowMs - last < limitMs) continue;
+                bool clock = clockStarts.Contains(sid);
+                if (!clock && (!settings.closeIdleHelpers || last <= 0 || nowMs - last < limitMs)) continue;
+                if (clock && last > 0 && nowMs - last < 60000) continue;   // give it a minute after replying
                 int pid = (int)(Dbl(Get(info, "pid")) ?? 0);
                 if (pid <= 0) continue;
                 using (var p = Process.GetProcessById(pid))
@@ -602,8 +621,9 @@ static class Data
         if (f.A != null) return f.A;
         var a = new Analysis();
         var lines = TailLines(path, TailBytes);
-        // A chat the panel opened only to start an account's 5-hour clock is small and carries a marker.
-        a.KeepClock = f.Size < 128 * 1024 && lines.Any(l => l.Contains(ClaudeTray.KeepClockMarker));
+        // A chat the panel opened only to start an account's 5-hour clock opens with a marker. The app
+        // writes a lot of setup text first (~600 KB), so look for it near the start, not by size.
+        a.KeepClock = f.Size < 2 * 1024 * 1024 && HeadText(path, 32 * 1024).Contains(ClaudeTray.KeepClockMarker);
         for (int i = lines.Count - 1; i >= 0; i--)
         {
             var line = lines[i];
@@ -644,7 +664,10 @@ static class Data
                 {
                     var content = Get(msg, "content") as object[];
                     bool toolResult = content != null && content.Any(c => c is Dictionary<string, object> && Str((Dictionary<string, object>)c, "type") == "tool_result");
-                    a.LastKind = toolResult ? "tool" : "user";
+                    // Stopped mid-answer with Esc: left hanging, so it waits for you like an answered chat.
+                    string text = Get(msg, "content") as string ?? (content == null ? null : string.Concat(content.OfType<Dictionary<string, object>>().Select(c => Str(c, "text"))));
+                    bool interrupted = text != null && text.StartsWith("[Request interrupted by user");
+                    a.LastKind = interrupted ? "interrupted" : toolResult ? "tool" : "user";
                 }
             }
             if (a.LastKind != null && a.LastTs != null && a.Title != null && a.Ctx != null) break;
@@ -700,7 +723,8 @@ static class Data
                 }
         foreach (var k in facts.Keys.Where(k => !seen.Contains(k)).ToList()) facts.Remove(k);
         // Closing an idle helper would kill a job it still has running in the background.
-        CloseIdleHelpers(live, marks, settings, new HashSet<string>(rows.Where(r => r.Info != null && RunningJobs(r.A, r.Info, now) > 0).Select(r => r.Sid)));
+        CloseIdleHelpers(live, marks, settings, new HashSet<string>(rows.Where(r => r.Info != null && RunningJobs(r.A, r.Info, now) > 0).Select(r => r.Sid)),
+            new HashSet<string>(rows.Where(r => r.A.KeepClock).Select(r => r.Sid)));
 
         Func<Row, string> orgOf = r =>
         {
@@ -727,13 +751,17 @@ static class Data
         var buckets = new Dictionary<string, Dictionary<string, List<Dictionary<string, object>>>>();
         Func<Dictionary<string, List<Dictionary<string, object>>>> newBucket = () => Cats.ToDictionary(c => c, c => new List<Dictionary<string, object>>());
         var flat = newBucket();
-        var handedOff = settings.keepCut ? HandedOff() : new HashSet<string>();
+        var handedOff = HandedOff();
 
         foreach (var r in rows)
         {
             var info = r.Info ?? new Dictionary<string, object>();
             Dictionary<string, object> rec; recs.TryGetValue(r.Sid, out rec);
-            if (Truthy(Get(rec, "isArchived")) || r.A.KeepClock) continue;
+            if (r.A.KeepClock) continue;
+            // The app archives idle chats on its own (Settings: archive inactive sessions), which would
+            // otherwise take every cut chat away a day after the limit. A kept cut chat outlives that.
+            bool keptCut = settings.keepCut && r.A.LastKind == "limit" && !handedOff.ContainsKey(r.Sid);
+            if (Truthy(Get(rec, "isArchived")) && !keptCut) continue;
             bool alive = Truthy(Get(info, "alive"));
             bool busy = alive && Str(info, "status") == "busy";
             bool background = !busy && RunningJobs(r.A, info, now) > 0;
@@ -741,12 +769,15 @@ static class Data
             string cat = null;
             if (busy || background) cat = "working";
             else if (five.Contains(r) && r.A.ResetAt == latestReset) cat = "cut";
-            else if (settings.keepCut && r.A.LastKind == "limit" && !handedOff.Contains(r.Sid)) cat = "cut";
-            else if (now - last < ActiveWindow && (r.A.LastKind == "assistant" || r.A.LastKind == "error" || r.A.LastKind == "limit")) cat = "waiting";
+            else if (keptCut) cat = "cut";
+            else if (now - last < ActiveWindow && (r.A.LastKind == "assistant" || r.A.LastKind == "error" || r.A.LastKind == "limit" || r.A.LastKind == "interrupted")) cat = "waiting";
 
             // Finished stays hidden until the conversation gets new activity after it was finished.
             double finished = marks.FinishedAt(r.Sid);
             if (finished > 0 && last <= finished + 5 && cat != "working") continue;
+            // Handed off: it carries on in the new chat, so it leaves the list like a finished one.
+            double handed;
+            if (handedOff.TryGetValue(r.Sid, out handed) && last <= handed + 5 && cat != "working" && !marks.IsPinned(r.Sid)) continue;
             // Answered, but a job it started is still running: listed with working, drawn differently.
             string stateCat = background ? "background" : cat;
             if (marks.IsPinned(r.Sid)) cat = "pinned";
@@ -761,7 +792,7 @@ static class Data
             string title = Or(Str(rec, "title"), Str(info, "name"), r.A.Title) ?? TitleFromFile(r.Path, r.F) ?? "Untitled conversation";
             string host = Or(Str(rec, "sessionId"), Str(info, "hostSessionId"));
             string cwd = Or(Str(rec, "cwd"), Str(info, "cwd"));
-            string note = r.A.LastKind == "error" ? "stopped on an error" : r.A.LastKind == "limit" ? (r.A.LimitKind == "seven_day" ? "hit the weekly limit" : "hit a limit") : null;
+            string note = r.A.LastKind == "error" ? "stopped on an error" : r.A.LastKind == "interrupted" ? "you stopped it" : r.A.LastKind == "limit" ? (r.A.LimitKind == "seven_day" ? "hit the weekly limit" : "hit a limit") : null;
             double since = (Dbl(Get(info, "statusUpdatedAt")) ?? 0) / 1000;
             var item = new Dictionary<string, object>
             {

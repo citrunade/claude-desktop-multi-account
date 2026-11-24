@@ -155,7 +155,7 @@ class ManageForm : Form
             ClaudeTray.Fetch();
         });
         keepCut.Location = new Point(P(270), P(738));
-        tip.SetToolTip(keepCut, "Keep every conversation that hit a limit and wasn't continued in a new chat on another account,\nunder \"Cut\", however long ago it stopped. It leaves once you hand it off, mark it finished, or carry on in it.");
+        tip.SetToolTip(keepCut, "Keep every conversation that hit a limit and wasn't continued in a new chat on another account,\nunder \"Cut\" for up to 8 days, even after Claude archives it. It leaves once you hand it off, mark it finished, or carry on in it.");
         Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, cutLabel, keepCut });
 
         addBtn = MakeButton("+ Add account", P(130));
