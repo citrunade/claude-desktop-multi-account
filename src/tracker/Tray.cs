@@ -25,7 +25,6 @@ static class ClaudeTray
     public static readonly string Dir = Path.GetDirectoryName(Application.ExecutablePath);
     static NotifyIcon tray;
     static Icon currentIcon;
-    static double lastCutReset;
     public static Panel panel;
     public static Dictionary<string, object> State;
     static bool fetching;
@@ -244,22 +243,14 @@ static class ClaudeTray
         int unseen = Arr(d, "unseen").Length, waiting = Arr(d, "waiting").Length;
         if (unseen > lastUnseen && lastUnseen >= 0) panel.FlashNew();   // a new answer came in
         lastUnseen = unseen;
-        int working = Arr(d, "working").Length, cut = Arr(d, "cut").Length;
+        int working = Arr(d, "working").Length;
         SetIcon(double.IsNaN(five) ? (double?)null : five, unseen > 0);
         string tip = (double.IsNaN(five) ? "5h ?" : "5h " + Math.Round(five) + "%")
                    + (double.IsNaN(week) ? "" : " · wk " + Math.Round(week) + "%")
-                   + "\n" + unseen + " new · " + waiting + " seen · " + working + " working · " + cut + " cut";
+                   + "\n" + unseen + " new · " + waiting + " seen · " + working + " working";
         tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
 
-        // One alert when the limit that cut conversations resets (Claude itself alerts on replies).
-        double reset = d["cutResetsAt"] == null ? 0 : Num(d["cutResetsAt"]);
         double now = Num(d["now"]);
-        if (reset > 0 && lastCutReset == reset && reset <= now && cut > 0)
-        {
-            tray.ShowBalloonTip(8000, "Limit has reset", cut + " cut conversation" + (cut == 1 ? "" : "s") + " can resume", ToolTipIcon.Info);
-            lastCutReset = -1;
-        }
-        else if (reset > now) lastCutReset = reset;
 
         AutoHandoff(d, now);
         KeepClock(d, now);
@@ -364,7 +355,7 @@ static class ClaudeTray
         foreach (Dictionary<string, object> acct in Arr(d, "accounts"))
         {
             int from = Convert.ToInt32(acct["n"]);
-            foreach (var cat in new[] { "cut", "unseen", "waiting", "pinned" })
+            foreach (var cat in new[] { "unseen", "waiting", "pinned" })
                 foreach (Dictionary<string, object> it in Arr(acct, cat))
                 {
                     if (!(it.ContainsKey("limited") && it["limited"] is bool && (bool)it["limited"])) continue;
@@ -761,7 +752,7 @@ class Panel : Form
         var st = ClaudeTray.State;
         var cur = ClaudeTray.Current();
         double five = ClaudeTray.Pct(cur, "five_hour");
-        int unseen = ClaudeTray.Arr(st, "unseen").Length, working = ClaudeTray.Arr(st, "working").Length, cut = ClaudeTray.Arr(st, "cut").Length;
+        int unseen = ClaudeTray.Arr(st, "unseen").Length, working = ClaudeTray.Arr(st, "working").Length;
         // A new answer: the bar glows amber, pulsing for a few seconds, then keeps a faint glow while any are unseen.
         double flash = (flashUntil - DateTime.UtcNow).TotalMilliseconds;
         int glow = flash > 0 ? (int)(60 + 70 * Math.Abs(Math.Sin(flash / 1000.0 * Math.PI * 1.5))) : unseen > 0 ? 28 : 0;
@@ -775,7 +766,6 @@ class Panel : Form
         var parts = new List<KeyValuePair<string, Color>>();
         if (unseen > 0) parts.Add(new KeyValuePair<string, Color>(unseen + " new", Ui.Warn));
         if (working > 0) parts.Add(new KeyValuePair<string, Color>(working + " busy", Ui.Blue));
-        if (cut > 0) parts.Add(new KeyValuePair<string, Color>(cut + " cut", Ui.Bad));
         if (parts.Count == 0) parts.Add(new KeyValuePair<string, Color>("all quiet", Ui.Dim));
         using (var f = new Font("Segoe UI", 9f))
             foreach (var kv in parts)
@@ -1547,7 +1537,7 @@ class Board : DoubleBufferedControl
 
     static readonly string[][] Groups = {
         new[] { "pinned", "PINNED" }, new[] { "working", "WORKING" }, new[] { "unseen", "NEW, NOT SEEN" },
-        new[] { "waiting", "SEEN, WAITING FOR YOU" }, new[] { "cut", "CUT BY A LIMIT" } };
+        new[] { "waiting", "SEEN, WAITING FOR YOU" } };
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -1683,13 +1673,6 @@ class Board : DoubleBufferedControl
             if (items.Length == 0) continue;
             any = true;
             TextRenderer.DrawText(g, gr[1] + "  " + items.Length, fLabel, new Point(x, y + P(4)), Ui.Faint, TextFormatFlags.NoPadding);
-            if (gr[0] == "cut" && a["cutResetsAt"] != null)
-            {
-                double r = ClaudeTray.Num(a["cutResetsAt"]);
-                string sub = r > Ui.Now() ? "resume in " + Ui.Dur(r - Ui.Now()) : "ready to resume";
-                var ss = TextRenderer.MeasureText(g, sub, fTiny, Size.Empty, TextFormatFlags.NoPadding);
-                TextRenderer.DrawText(g, sub, fTiny, new Point(x + w - ss.Width, y + P(4)), Ui.Dim, TextFormatFlags.NoPadding);
-            }
             y += P(22);
             foreach (Dictionary<string, object> it in items) y += DrawRow(g, it, gr[0], x - P(6), y, w + P(12));
         }
@@ -1821,7 +1804,7 @@ class Board : DoubleBufferedControl
             double c = ClaudeTray.Num(it["ctx"]);
             ctxText = (c >= 1000000 ? (c / 1000000).ToString("0.0") + "M" : Math.Round(c / 1000) + "k") + " context";
         }
-        if (!(it["running"] is bool && (bool)it["running"]) && realKey != "cut") meta.Add("closed");
+        if (!(it["running"] is bool && (bool)it["running"]) ) meta.Add("closed");
         // Context size first and a little brighter than the rest of the line.
         int mx = tx;
         if (ctxText != null)

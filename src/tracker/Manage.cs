@@ -69,7 +69,7 @@ class ManageForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;   // always above the panel, which is itself always on top
-        ClientSize = new Size(P(620), P(878));
+        ClientSize = new Size(P(620), P(840));
         // Keep the whole window on screen (Windows can place it so the bottom buttons fall off).
         Shown += (s, e) =>
         {
@@ -154,25 +154,17 @@ class ManageForm : Form
         });
         clock.Location = new Point(P(270), P(700));
         tip.SetToolTip(clock, "When an account's 5-hour limit isn't counting down, it gets a one-line message in a new chat so the\n5 hours start now. This opens that chat and presses Enter. \"Away\" waits for 2 minutes without mouse or\nkeyboard use; \"even while using\" sends right away, pausing your mouse and keys for a moment. These chats\ndon't show in the panel.");
-        var cutLabel = new Label { Text = "Chats cut by a limit", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(744)) };
-        var keepCut = MakeChoice(new[] { "Hide like other chats", "Keep until handed off" }, s0.keepCut ? 1 : 0, P(330), idx =>
-        {
-            var st = Accounts.Load(); st.keepCut = idx == 1; Accounts.Save(st);
-            ClaudeTray.Fetch();
-        });
-        keepCut.Location = new Point(P(270), P(738));
-        tip.SetToolTip(keepCut, "Keep every conversation that hit a limit and wasn't continued in a new chat on another account,\nunder \"Cut\" for up to 8 days, even after Claude archives it. It leaves once you hand it off, mark it finished, or carry on in it.");
-        var launchLabel = new Label { Text = "Over full-screen games", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(782)) };
+        var launchLabel = new Label { Text = "Over full-screen apps", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(744)) };
         var launch = MakeChoice(new[] { "Keep the bar showing", "Hide the bar" }, s0.hideOverGames ? 1 : 0, P(330), idx =>
         {
             var st = Accounts.Load(); st.hideOverGames = idx == 1; Accounts.Save(st);
         });
-        launch.Location = new Point(P(270), P(776));
-        tip.SetToolTip(launch, "While a game or video fills the whole screen, the taskbar bar either stays where it is\n(it doesn't move or re-raise itself during the game) or is taken away until you leave it.");
-        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, cutLabel, keepCut, launchLabel, launch });
+        launch.Location = new Point(P(270), P(738));
+        tip.SetToolTip(launch, "While a game, video or other app fills the whole screen, the taskbar bar either stays where it is\n(it doesn't move or re-raise itself during the game) or is taken away until you leave it.");
+        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, launchLabel, launch });
 
         addBtn = MakeButton("+ Add account", P(130));
-        addBtn.Location = new Point(P(18), P(828));
+        addBtn.Location = new Point(P(18), P(790));
         // Adding an account opens it straight away on Claude's sign-in screen.
         addBtn.Click += (s, e) =>
         {
@@ -185,7 +177,7 @@ class ManageForm : Form
                 return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
             });
         };
-        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(826)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(788)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
         Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, byLabel, by, capLabel, capWeek, orLabel, capFive, addBtn, status });
         Reload();
     }

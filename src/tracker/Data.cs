@@ -9,7 +9,7 @@ using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 
 // Reads Claude's own files and works out, per account: plan limits and the conversations that
-// need you (working, new, waiting, cut by a limit, pinned). Everything the panel shows comes from here.
+// need you (working, new, waiting, pinned). Everything the panel shows comes from here.
 // Output is plain dictionaries and object[] arrays, the same shape the panel draws from.
 static class Data
 {
@@ -24,7 +24,7 @@ static class Data
     const string SpecialOrg = "00000000-0000-4000-8000-000000000001";
     const double ScanWindow = 8 * 86400;
     const int TailBytes = 256 * 1024;
-    static readonly string[] Cats = { "pinned", "working", "unseen", "waiting", "cut" };
+    static readonly string[] Cats = { "pinned", "working", "unseen", "waiting" };
 
     static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
@@ -735,8 +735,6 @@ static class Data
             return r.Org;
         };
 
-        var five = rows.Where(r => r.A.LastKind == "limit" && r.A.ResetAt != null && r.A.LimitKind == "five_hour").ToList();
-        double? latestReset = five.Count > 0 ? five.Max(r => r.A.ResetAt) : null;
         var rejections = new Dictionary<string, Dictionary<string, double>>();
         foreach (var r in rows)
             if (r.A.LastKind == "limit" && r.A.ResetAt != null && r.A.ResetAt > now)
@@ -758,18 +756,13 @@ static class Data
             var info = r.Info ?? new Dictionary<string, object>();
             Dictionary<string, object> rec; recs.TryGetValue(r.Sid, out rec);
             if (r.A.KeepClock) continue;
-            // The app archives idle chats on its own (Settings: archive inactive sessions), which would
-            // otherwise take every cut chat away a day after the limit. A kept cut chat outlives that.
-            bool keptCut = settings.keepCut && r.A.LastKind == "limit" && !handedOff.ContainsKey(r.Sid);
-            if (Truthy(Get(rec, "isArchived")) && !keptCut) continue;
+            if (Truthy(Get(rec, "isArchived"))) continue;
             bool alive = Truthy(Get(info, "alive"));
             bool busy = alive && Str(info, "status") == "busy";
             bool background = !busy && RunningJobs(r.A, info, now) > 0;
             double last = r.A.LastTs ?? r.Mtime;
             string cat = null;
             if (busy || background) cat = "working";
-            else if (five.Contains(r) && r.A.ResetAt == latestReset) cat = "cut";
-            else if (keptCut) cat = "cut";
             else if (now - last < ActiveWindow && (r.A.LastKind == "assistant" || r.A.LastKind == "error" || r.A.LastKind == "limit" || r.A.LastKind == "interrupted")) cat = "waiting";
 
             // Finished stays hidden until the conversation gets new activity after it was finished.
@@ -889,7 +882,7 @@ static class Data
         if (newest != null) newest["current"] = true;
 
         openIndex = index;
-        var result = new Dictionary<string, object> { { "now", now }, { "accounts", accounts.Cast<object>().ToArray() }, { "cutResetsAt", latestReset } };
+        var result = new Dictionary<string, object> { { "now", now }, { "accounts", accounts.Cast<object>().ToArray() } };
         foreach (var c in Cats) result[c] = flat[c].OrderByDescending(x => (double)x["lastActivity"]).Cast<object>().ToArray();
         return result;
     }

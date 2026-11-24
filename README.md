@@ -7,12 +7,12 @@ Bonus: track each conversation's context, pin conversations, open any conversati
 For Windows. Nothing to download but this source: it builds on your PC with the compiler that ships with Windows.
 
 <p align="center">
-  <img src="docs/panel.png" width="380" alt="The Claude Tracker panel: three accounts with their 5-hour and weekly usage, and their conversations grouped as pinned, working, new, waiting and cut by the limit">
+  <img src="docs/panel.png" width="380" alt="The Claude Tracker panel: three accounts with their 5-hour and weekly usage, and their conversations grouped as pinned, working, new and waiting">
   &nbsp;&nbsp;
   <img src="docs/settings.png" width="420" alt="The accounts window: name and icon for each account, plus settings for hiding conversations and handing off at the limit">
 </p>
 <p align="center">
-  <img src="docs/bar.png" width="216" alt="The bar on the taskbar: 34% of the 5-hour limit used, 2 new, 2 busy, 1 cut">
+  <img src="docs/bar.png" width="216" alt="The bar on the taskbar: 34% of the 5-hour limit used, 2 new, 2 busy">
 </p>
 <p align="center"><sub>Sample accounts and conversations. Above: the panel and the settings window. Below: the bar that sits on the taskbar.</sub></p>
 
@@ -26,7 +26,7 @@ For Windows. Nothing to download but this source: it builds on your PC with the 
 ### The taskbar widget (Claude Tracker)
 A small always-on-top panel, opened from its icon by the clock. The icon shows how much of your 5-hour limit you've used.
 
-- **A bar on the taskbar** shows your 5-hour use and how many conversations are new, busy or cut. Drag it left or right to any free spot on the taskbar.
+- **A bar on the taskbar** shows your 5-hour use and how many conversations are new or busy. Drag it left or right to any free spot on the taskbar.
 - **The panel opens above the bar.** Choose separately for when a Claude window is in front and for everything else: it **stays open**, or it **opens when the mouse rests on the bar** and fades away when the mouse leaves. Switch with the two small toggles at the bottom of the panel.
 - **Switching windows is instant:** the panel appears or disappears the moment you go to or from Claude. When Claude is minimised or brought back, it fades along with it.
 - **The conversation open in each account's window is highlighted**, a little stronger for the window in front.
@@ -36,7 +36,7 @@ A small always-on-top panel, opened from its icon by the clock. The icon shows h
   - **Working:** Claude is replying right now.
   - **New, not seen:** finished while you were away.
   - **Seen, waiting for you.**
-  - **Cut by the 5-hour limit**, with when you can resume.
+  - A chat that hit a limit sits with the others, marked "hit a limit".
 - **Context used** by each conversation (for example "132k context").
 - **One click** opens a conversation in the right account's window.
 - **+ New** starts a new Claude Code chat on that account.
