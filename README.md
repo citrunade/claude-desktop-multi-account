@@ -57,7 +57,7 @@ You choose:
 ## Install
 
 1. Install the Claude desktop app from <https://claude.ai/download>.
-2. Download this repository (green **Code** button → **Download ZIP**) and unzip it.
+2. Download the zip from the [latest release](https://github.com/citrunade/claude-desktop-multi-account/releases/latest) and unzip it.
 3. Double-click **install.cmd**. Say how many accounts you want, and whether you want the widget.
 4. Open each new shortcut once and sign in to a different account.
 
