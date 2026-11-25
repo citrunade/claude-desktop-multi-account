@@ -21,7 +21,35 @@ class BarWindow : Form
         Text = "Claude Tracker bar";
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         Cursor = Cursors.SizeWE;   // it slides along the taskbar
-        MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) owner.BarDown(); };
+        // The bar runs its own drag instead of Windows' title-bar drag: that one could miss the button
+        // being let go and stay "dragging", which froze the panel and turned the next click into a move.
+        MouseDown += (s, e) =>
+        {
+            if (e.Button != MouseButtons.Left) return;
+            pressAt = Cursor.Position; pressLeft = Left; pressed = true; moved = false;
+            Capture = true;
+        };
+        MouseMove += (s, e) =>
+        {
+            if (!pressed) return;
+            if ((Control.MouseButtons & MouseButtons.Left) == 0) { EndPress(false); return; }   // let go somewhere we didn't hear about
+            int dx = Cursor.Position.X - pressAt.X;
+            if (!moved && Math.Abs(dx) < SystemInformation.DragSize.Width) return;
+            moved = true;
+            owner.BarDragTo(pressLeft + dx);
+        };
+        MouseUp += (s, e) => { if (e.Button == MouseButtons.Left) EndPress(true); };
+        MouseCaptureChanged += (s, e) => { if (pressed) EndPress(false); };
+    }
+
+    Point pressAt; int pressLeft; bool pressed, moved;
+    void EndPress(bool released)
+    {
+        if (!pressed) return;
+        pressed = false;
+        if (Capture) Capture = false;
+        if (moved) owner.BarDropped();
+        else if (released) owner.BarClicked();
     }
 
     protected override bool ShowWithoutActivation { get { return true; } }
@@ -66,17 +94,4 @@ class BarWindow : Form
         using (var pen = new Pen(Ui.Line)) e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
     }
 
-    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
-    protected override void WndProc(ref Message m)
-    {
-        if (m.Msg == 0x216)   // WM_MOVING: stay on the taskbar
-        {
-            var rc = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
-            owner.BarMoving(ref rc.L, ref rc.T, ref rc.R, ref rc.B);
-            Marshal.StructureToPtr(rc, m.LParam, false);
-            m.Result = (IntPtr)1;
-            return;
-        }
-        base.WndProc(ref m);
-    }
 }

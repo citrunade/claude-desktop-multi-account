@@ -863,9 +863,12 @@ class Panel : Form
         if (btnGear.Contains(e.Location)) { ClaudeTray.OpenManager(); return; }
         var start = Location;
         dragging = true;
-        ReleaseCapture();
-        SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero); // drag like a title bar (returns when the mouse is let go)
-        dragging = false;
+        try
+        {
+            ReleaseCapture();
+            SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero); // drag like a title bar (returns when the mouse is let go)
+        }
+        finally { dragging = false; }
         if (Location == start)
         {
             // A plain click on the shrunk bar reopens it (in "stays open" mode).
@@ -972,33 +975,32 @@ class Panel : Form
     }
 
     // The bar was pressed: drag it along the taskbar, or a plain click opens / shrinks the panel.
-    public void BarDown()
+    DateTime lastBarClick = DateTime.MinValue;
+    public void BarClicked()
     {
-        var start = bar.Location;
+        // A double-click is two presses: the second must not shrink what the first just opened.
+        var now = DateTime.UtcNow;
+        bool quickSecond = (now - lastBarClick).TotalMilliseconds < SystemInformation.DoubleClickTime;
+        lastBarClick = now;
+        if (quickSecond) return;
+        if (!hoverMode) ClickToggle(!targetCollapsed);
+        else if (targetCollapsed) { hoverAt = DateTime.MinValue; AnimateTo(false); }
+    }
+    // While the bar is dragged: it stays on the taskbar, and an open panel above it comes along.
+    public void BarDragTo(int left)
+    {
         dragging = true;
-        try
-        {
-            ReleaseCapture();
-            SendMessage(bar.Handle, 0xA1, (IntPtr)2, IntPtr.Zero);   // drag like a title bar (returns when let go)
-        }
-        finally { dragging = false; }   // stuck "dragging" would freeze the panel shut
-        if (bar.Location == start)
-        {
-            if (!hoverMode) ClickToggle(!targetCollapsed);
-            else if (targetCollapsed) { hoverAt = DateTime.MinValue; AnimateTo(false); }
-            return;
-        }
+        var tb = TaskbarStrip(); var pr = PillRect();
+        int l = Math.Max(tb.Left, Math.Min(left, tb.Right - pr.Width));
+        bar.Bounds = new Rectangle(l, pr.Y, pr.Width, pr.Height);
+        if (!collapsed && hoverMode && !anim.Enabled) Location = OpenRect(bar.Bounds).Location;
+    }
+    public void BarDropped()
+    {
+        dragging = false;
         SavePill(bar.Left);
         bar.Bounds = PillRect();
         if (!collapsed && hoverMode) { Location = OpenRect().Location; restAt = Location; }
-    }
-    // While the bar is dragged: it stays on the taskbar, and an open panel above it comes along.
-    public void BarMoving(ref int l, ref int tp, ref int r, ref int b)
-    {
-        var tb = TaskbarStrip(); var pr = PillRect(); int pw = r - l;
-        l = Math.Max(tb.Left, Math.Min(l, tb.Right - pw)); r = l + pw;
-        tp = pr.Y; b = pr.Y + pr.Height;
-        if (!collapsed && hoverMode && !anim.Enabled) Location = OpenRect(new Rectangle(l, tp, pw, pr.Height)).Location;
     }
 
     // Where the panel sits when open: above the bar in hover mode, or where you put it in "stays open".
@@ -1046,6 +1048,8 @@ class Panel : Form
     // Runs every 40 ms: cheap (front window and mouse position; the process is looked up only when the front window changes).
     public void AutoTick()
     {
+        // Safety net: "dragging" with the mouse button up means the end of a drag was missed. Don't stay frozen.
+        if (dragging && (Control.MouseButtons & MouseButtons.Left) == 0) dragging = false;
         if (!Visible || dragging) return;
         var s = Settings();
         bool mine;
