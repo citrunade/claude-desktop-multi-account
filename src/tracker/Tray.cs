@@ -971,6 +971,7 @@ class Panel : Form
         if (++pillTicks % 8 != 0 && !changed && !bar.TaskbarInFront()) return;
         var pr = PillRect();
         if (bar.Bounds != pr) bar.Bounds = pr;
+        if (!collapsed) RaiseToTop();   // the panel first, so the bar ends up above it
         SetWindowPos(bar.Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10);   // topmost, no move, no size, no focus
     }
 
@@ -1178,6 +1179,16 @@ class Panel : Form
         int ex = GetWindowLong(Handle, -20);
         int want = show ? ex & ~0x20 : ex | 0x20;   // WS_EX_TRANSPARENT
         if (want != ex) SetWindowLong(Handle, -20, want);
+        if (show) RaiseToTop();
+    }
+
+    // Still marked "on top", the panel can end up under ordinary windows (seen under maximised Claude,
+    // Chrome and Discord windows), and it then "opens" out of sight. Put it back on top: whenever it
+    // opens, and now and then while it is open, the way the bar is kept on top.
+    void RaiseToTop()
+    {
+        if (!IsHandleCreated) return;
+        SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10);   // topmost, no move, no size, no focus
     }
 
     [DllImport("dwmapi.dll")] static extern int DwmFlush();
