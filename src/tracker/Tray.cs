@@ -335,6 +335,12 @@ static class ClaudeTray
             double asOf = a["asOf"] == null ? double.NaN : Num(a["asOf"]);
             if (!double.IsNaN(reset) && reset > now) { ClockNote(key, "window running"); continue; }
             if (double.IsNaN(reset) && !double.IsNaN(pct) && pct > 0 && now - asOf < 5 * 3600) { ClockNote(key, "used lately (" + Math.Round(pct) + "%), reset time unknown"); continue; }
+            // An account past the weekly hand-off ceiling won't be moved to, so its 5 hours aren't worth starting.
+            double week = Pct(a, "seven_day"), weekReset = ResetAt(a, "seven_day");
+            if (!double.IsNaN(weekReset) && weekReset <= now) week = 0;
+            int weekCap = Math.Min(100, cs.handoffMaxWeekly);
+            if (!double.IsNaN(week) && week >= weekCap) { ClockNote(key, "weekly use " + Math.Round(week) + "% is at or past the " + weekCap + "% skip setting"); continue; }
+            if (a["cutResetsAt"] != null && Num(a["cutResetsAt"]) > now) { ClockNote(key, "cut off by a limit right now"); continue; }
             double last; clockStarts.TryGetValue(n.ToString(), out last);
             if (now - last < 5 * 3600) { ClockNote(key, "started or tried under 5 hours ago"); continue; }
             if (!away) { ClockNote(key, "window not running; waiting for 2 minutes without mouse or keyboard"); continue; }
@@ -570,16 +576,22 @@ static class ClaudeTray
             string moved = "First: this work belongs in the folder " + folder + ". If this chat's working folder is a different one, " +
                            "move this chat there with your change-directory tool before anything else.\n\n" + text;
             AllowSetForegroundWindow(-1);
+            var sentAt = DateTime.UtcNow;
             AutoSend.NewChatAndPaste(n, panel, moved, send, ok =>
             {
                 if (!ok) Handoff(sid, n, send, doneTitle, true);
-                else try { Clipboard.SetText(moved); } catch { }   // backup, as on the other path
+                else
+                {
+                    try { Clipboard.SetText(moved); } catch { }   // backup, as on the other path
+                    if (send) MakeSureSent(sid, n, sentAt, doneTitle);
+                }
                 Fetch();
             });
             return;
         }
         bool askTrust = folder != null;
         if (askTrust) send = false;
+        var startedAt = DateTime.UtcNow;
         Act(() =>
         {
             bool ok = Data.StartConversation(n, text, folder);
@@ -589,9 +601,43 @@ static class ClaudeTray
                 AutoSend.Run(n, panel, sent =>
                 {
                     if (!sent) tray.ShowBalloonTip(8000, "Press Enter to continue", "The new chat on " + doneTitle + " is ready, but its window wasn't in front, so it wasn't sent.", ToolTipIcon.Info);
+                    else MakeSureSent(sid, n, startedAt, doneTitle);
                 });
             return ok;
         }, "Couldn't open that account.");
+    }
+
+    // Enter sometimes lands before the box is ready and nothing is sent. A few seconds after pressing it,
+    // look for the new chat; if none started, press Enter again (an empty box ignores an extra Enter).
+    // Two retries, then a note to press it yourself.
+    static void MakeSureSent(string sid, int n, DateTime since, string toName, int attempt = 0)
+    {
+        var t = new System.Windows.Forms.Timer { Interval = attempt == 0 ? 6000 : 5000 };
+        t.Tick += (s, e) =>
+        {
+            t.Stop(); t.Dispose();
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool started = false;
+                try { started = Data.ChatStartedWith(sid, since); } catch { }
+                IntPtr win = started ? IntPtr.Zero : Data.AccountWindow(n);
+                try
+                {
+                    panel.BeginInvoke((Action)(() =>
+                    {
+                        if (started) { Fetch(); return; }
+                        if (attempt >= 2 || win == IntPtr.Zero)
+                        {
+                            tray.ShowBalloonTip(8000, "Press Enter to continue", "The hand-off is in the new chat" + (toName != null ? " on " + toName : "") + " but didn't send. Press Enter there.", ToolTipIcon.Info);
+                            return;
+                        }
+                        AutoSend.PressEnter(win, ok => MakeSureSent(sid, n, since, toName, attempt + 1));
+                    }));
+                }
+                catch { }
+            });
+        };
+        t.Start();
     }
 
     static ManageForm manager;

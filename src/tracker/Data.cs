@@ -91,6 +91,20 @@ static class Data
             }
         }
     }
+    // Whether a chat started since `sinceUtc` carries the old chat's id, i.e. the hand-off was really sent.
+    public static bool ChatStartedWith(string sid, DateTime sinceUtc)
+    {
+        if (!Directory.Exists(ProjectsDir)) return false;
+        foreach (var dir in SafeDirs(ProjectsDir))
+            foreach (var path in SafeFiles(dir, "*.jsonl"))
+            {
+                if (Path.GetFileNameWithoutExtension(path) == sid) continue;
+                DateTime created;
+                try { created = File.GetCreationTimeUtc(path); } catch { continue; }
+                if (created >= sinceUtc.AddSeconds(-5) && HeadContains(path, sid)) return true;
+            }
+        return false;
+    }
     static bool HeadContains(string path, string needle)
     {
         try
