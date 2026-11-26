@@ -49,8 +49,10 @@ public class AccountSettings
     public bool keepClockAnytime = false;
     // When a conversation hits a usage limit: "off", "ask" (a notification to click) or "auto".
     public string autoHandoff = "ask";
-    // Which account counts as freest: "weekly", "five" (5-hour) or "both" (the fuller of the two decides).
+    // No longer used: the move at the limit goes to the suggested account. Kept so older settings still load.
     public string handoffPickBy = "both";
+    // The order accounts show in, by number (set with the arrows in the accounts window). Missing ones go last.
+    public List<int> accountOrder = new List<int>();
     // Never hand off to an account that has used this much (percent) of its weekly / 5-hour limit.
     public int handoffMaxWeekly = 90;
     public int handoffMaxFive = 90;
@@ -58,6 +60,13 @@ public class AccountSettings
     public List<int> autoLaunchAccounts = new List<int>();
     // Take the taskbar bar away while a full-screen game or video is in front (otherwise it stays over it).
     public bool hideOverGames = false;
+    // Near a chat's 5-hour limit, Claude finishes the step it is on, writes a short hand-off note
+    // (goal, decisions, state, next step) and stops, so a move to another account carries all that.
+    // The limits plugin reads these two from note-settings.json, which Save keeps up to date.
+    public bool handoffNote = true;
+    public int handoffNotePercent = 95;
+    // A chat left quiet for 55 minutes writes its hand-off note before Claude's hour of memory for it runs out.
+    public bool noteBeforeForgotten = true;
 }
 
 static class Accounts
@@ -89,6 +98,19 @@ static class Accounts
     {
         s.accounts = s.accounts.OrderBy(a => a.n).ToList();
         File.WriteAllText(SettingsFile, new JavaScriptSerializer().Serialize(s));
+        WriteNoteSettings(s);
+    }
+
+    // What the limits plugin reads to know whether, and at what percent, to ask for a hand-off note.
+    public static void WriteNoteSettings(AccountSettings s)
+    {
+        try
+        {
+            Directory.CreateDirectory(Data.NotesDir);
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(Data.NotesDir), "note-settings.json"),
+                new JavaScriptSerializer().Serialize(new Dictionary<string, object> { { "enabled", s.handoffNote }, { "percent", s.handoffNotePercent } }));
+        }
+        catch { }
     }
 
     public static string NameOf(AccountSettings s, int n)
@@ -138,7 +160,26 @@ static class Accounts
         foreach (var p in Data.Profiles())
             if (nums.Add(p.N)) list.Add(new AccountInfo { n = p.N, color = Palette[(p.N - 1) % Palette.Length] });
         if (nums.Add(1)) list.Add(new AccountInfo { n = 1, color = Palette[0] });
-        return list.OrderBy(a => a.n).ToList();
+        return list.OrderBy(a => Rank(s, a.n)).ToList();
+    }
+
+    // Where account n sits in your chosen order; accounts you haven't placed follow, by number.
+    public static int Rank(AccountSettings s, int n)
+    {
+        int i = s.accountOrder == null ? -1 : s.accountOrder.IndexOf(n);
+        return i >= 0 ? i : 1000 + n;
+    }
+
+    // Moves account n one place up (-1) or down (+1) in the order, among the accounts listed.
+    public static void MoveInOrder(int n, int step)
+    {
+        var s = Load();
+        var order = All().Select(a => a.n).ToList();   // the current order, every account placed
+        int i = order.IndexOf(n), j = i + step;
+        if (i < 0 || j < 0 || j >= order.Count) return;
+        order[i] = order[j]; order[j] = n;
+        s.accountOrder = order;
+        Save(s);
     }
 
     // ---------- icons ----------
@@ -562,6 +603,7 @@ static class Accounts
         ts = Regex.Replace(ts, "const DIR = '[^']*'", "const DIR = '" + dirForTs + "'");
         File.WriteAllText(reg, ts);
         Directory.CreateDirectory(Data.BySessionDir);
+        WriteNoteSettings(Load());
 
         var settingsPath = ClaudeSettingsPath();
         var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };

@@ -21,6 +21,95 @@ static class AutoSend
         });
     }
 
+    // The hand-off for a chat with a folder. Opening a chat from outside the app in a folder always makes
+    // Claude ask "Trust this workspace?", so instead this works the app like you would: brings the account's
+    // window forward (starting the account if it isn't open), presses Ctrl+Shift+N (new chat with the
+    // current settings), pastes the hand-off over anything left in the box and, with send, presses Enter.
+    // done(false) when it couldn't get the window in front; nothing was typed then.
+    public static void NewChatAndPaste(int n, Control ui, string text, bool send, Action<bool> done)
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            IntPtr win = Data.AccountWindow(n);
+            if (win == IntPtr.Zero)
+            {
+                Data.LaunchAccount(n);
+                for (int i = 0; i < 50 && win == IntPtr.Zero; i++) { Thread.Sleep(500); win = Data.AccountWindow(n); }
+                if (win == IntPtr.Zero) { Report(ui, done, false); return; }
+                Thread.Sleep(5000);   // let a freshly started account finish loading
+            }
+            try
+            {
+                ui.BeginInvoke((Action)(() =>
+                {
+                    try { Clipboard.SetText(text); } catch { done(false); return; }
+                    NewChatThenPaste(win, send, done);
+                }));
+            }
+            catch { Report(ui, done, false); }
+        });
+    }
+
+    // On the UI thread. Holds other input for the few seconds this takes.
+    static void NewChatThenPaste(IntPtr win, bool send, Action<bool> done)
+    {
+        Lock();
+        var safety = new System.Windows.Forms.Timer { Interval = 7000 };   // never hold input longer than this
+        safety.Tick += (s, e) => { safety.Stop(); safety.Dispose(); Unlock(); };
+        safety.Start();
+        Data.Focus(win);
+        int tries = 0;
+        var t = new System.Windows.Forms.Timer { Interval = 150 };
+        t.Tick += (s, e) =>
+        {
+            tries++;
+            bool front = GetForegroundWindow() == win;
+            if (!front && tries < 12) { Data.Focus(win); return; }
+            t.Stop(); t.Dispose();
+            if (!front) { Note("new chat not opened, window not in front after " + tries + " tries"); Unlock(); done(false); return; }
+            SendKeys(0x1B);   // Escape first: Ctrl+Shift+N does nothing while focus sits in an open chat's page
+            After(250, () => SendKeys(0x11, 0x10, 0x4E));   // Ctrl+Shift+N: new chat with the current settings
+            After(1850, () =>
+            {
+                if (GetForegroundWindow() != win) { Note("window lost the front before pasting"); Unlock(); done(false); return; }
+                // Clear any unsent draft left in the box (Ctrl+A doesn't select it there): Ctrl+End,
+                // Ctrl+Shift+Home, Delete.
+                SendKeys(0x11, 0x23);
+                After(120, () => SendKeys(0x11, 0x10, 0x24));
+                After(240, () => SendKeys(0x2E));
+                After(450, () => SendKeys(0x11, 0x56));   // Ctrl+V: the hand-off
+                After(1450, () =>
+                {
+                    bool still = GetForegroundWindow() == win;
+                    if (send && still) SendEnter();
+                    Note("new chat, pasted" + (send ? (still ? ", enter sent" : ", enter not sent (window lost the front)") : ", left for you to send"));
+                    After(150, () => { Unlock(); done(true); });
+                });
+            });
+        };
+        t.Start();
+    }
+
+    static void After(int ms, Action a)
+    {
+        var t = new System.Windows.Forms.Timer { Interval = ms };
+        t.Tick += (s, e) => { t.Stop(); t.Dispose(); a(); };
+        t.Start();
+    }
+
+    // Presses the keys in order and lets them go in reverse (a shortcut such as Ctrl+Shift+N).
+    static void SendKeys(params ushort[] vks)
+    {
+        var inputs = new INPUT[vks.Length * 2];
+        for (int i = 0; i < vks.Length; i++) { inputs[i].type = 1; inputs[i].ki.wVk = vks[i]; inputs[i].ki.dwExtraInfo = Mine; }
+        for (int i = 0; i < vks.Length; i++)
+        {
+            var k = vks.Length + i;
+            inputs[k].type = 1; inputs[k].ki.wVk = vks[vks.Length - 1 - i]; inputs[k].ki.dwFlags = 2; inputs[k].ki.dwExtraInfo = Mine;
+        }
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+    }
+
     static void Report(Control ui, Action<bool> done, bool ok)
     {
         try { ui.BeginInvoke((Action)(() => done(ok))); } catch { }

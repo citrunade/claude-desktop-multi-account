@@ -10,9 +10,8 @@ class ManageForm : Form
 {
     static readonly string[] Kinds = { "tint", "claude", "number", "file" };
     static readonly string[] KindNames = { "Claude icon in a colour", "Claude icon, unchanged", "Number in a colour", "My own picture…" };
-    static readonly string[] PickModes = { "weekly", "five", "both" };
-    static readonly string[] PickNames = { "the most weekly limit left for its reset", "the most 5-hour limit left for its reset", "the most left on both, for their resets" };
     static readonly int[] CapChoices = { 50, 60, 70, 80, 90, 95, 100 };
+    static readonly int[] NotePercents = { 90, 95, 98 };
     static int CapIndex(int v) { int i = 0; for (int k = 0; k < CapChoices.Length; k++) if (CapChoices[k] <= v) i = k; return i; }
     static readonly string[] AutoModes = { "off", "ask", "auto", "send" };
     static readonly string[] AutoNames = { "Do nothing", "Ask me to move it to the freest account", "Move it, I press Enter", "Move it and send it by itself" };
@@ -69,7 +68,7 @@ class ManageForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;   // always above the panel, which is itself always on top
-        ClientSize = new Size(P(620), P(840));
+        ClientSize = new Size(P(620), P(916));
         // Keep the whole window on screen (Windows can place it so the bottom buttons fall off).
         Shown += (s, e) =>
         {
@@ -112,12 +111,10 @@ class ManageForm : Form
 
         // Which account to move it to, and which accounts are too full to take it.
         var s0 = Accounts.Load();
-        var byLabel = new Label { Text = "Move it to the account with", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(548)) };
-        var by = MakeChoice(PickNames, Math.Max(0, Array.IndexOf(PickModes, s0.handoffPickBy ?? "both")), P(310), idx =>
-        {
-            var st = Accounts.Load(); st.handoffPickBy = PickModes[idx]; Accounts.Save(st);
-        });
-        by.Location = new Point(P(290), P(542));
+        var byLabel = new Label { Text = "Move it to", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(548)) };
+        // The same account the hand-off card marks as suggested.
+        var by = new Label { Text = "the suggested account (hover for how it's picked)", ForeColor = Ui.Text, AutoSize = true, Location = new Point(P(290), P(548)) };
+        tip.SetToolTip(by, "The same account the hand-off button marks as Suggested: one with room left in its 5 hours\n(counting chats already running there) whose weekly allowance is most likely to go unused\nbefore it resets. Close calls go to the one whose 5-hour limit resets sooner.");
         var capLabel = new Label { Text = "Skip an account once it has used", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(586)) };
         var pctNames = CapChoices.Select(c => c >= 100 ? "100% (until full)" : c + "%").ToArray();
         var capWeek = MakeChoice(pctNames.Select(x => x + " weekly").ToArray(), CapIndex(s0.handoffMaxWeekly), P(150), idx =>
@@ -161,10 +158,28 @@ class ManageForm : Form
         });
         launch.Location = new Point(P(270), P(738));
         tip.SetToolTip(launch, "While a game, video or other app fills the whole screen, the taskbar bar either stays where it is\n(it doesn't move or re-raise itself during the game) or is taken away until you leave it.");
-        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, launchLabel, launch });
+        // Near the 5-hour limit: finish the step, write a hand-off note, stop.
+        var noteLabel = new Label { Text = "Near a chat's 5-hour limit", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(782)) };
+        int notePick = !s0.handoffNote ? 0 : Math.Max(1, Array.IndexOf(NotePercents, s0.handoffNotePercent) + 1);
+        if (s0.handoffNote && Array.IndexOf(NotePercents, s0.handoffNotePercent) < 0) notePick = 2;
+        var note = MakeChoice(new[] { "Keep going" }.Concat(NotePercents.Select(v => "At " + v + "%, write a hand-off note and stop")).ToArray(), notePick, P(330), idx =>
+        {
+            var st = Accounts.Load(); st.handoffNote = idx > 0; if (idx > 0) st.handoffNotePercent = NotePercents[idx - 1]; Accounts.Save(st);
+        });
+        note.Location = new Point(P(270), P(776));
+        tip.SetToolTip(note, "When a chat's account has used this much of its 5-hour limit, Claude finishes the step it is on,\nwrites a short note (the goal, what was decided and why, what is done and half-done, the next step)\nand stops. Moving that chat to another account then hands the new chat this note, so nothing\ndecided earlier gets lost. It asks once per chat in each 5-hour window; if you carry on, it lets you.\nThe last few percent are kept so there is room to write the note.");
+        // Before Claude forgets a quiet chat (it remembers one cheaply for an hour), have it write its note.
+        var quietLabel = new Label { Text = "Before a quiet chat is forgotten", ForeColor = Ui.Dim, AutoSize = true, Location = new Point(P(18), P(820)) };
+        var quiet = MakeChoice(new[] { "Do nothing", "After 55 minutes, write a hand-off note" }, s0.noteBeforeForgotten ? 1 : 0, P(330), idx =>
+        {
+            var st = Accounts.Load(); st.noteBeforeForgotten = idx == 1; Accounts.Save(st);
+        });
+        quiet.Location = new Point(P(270), P(814));
+        tip.SetToolTip(quiet, "Claude remembers a chat cheaply for an hour after its last message. After that, carrying it on\nmeans reading the whole chat back in, which uses far more of your limit. So a chat left alone for\n55 minutes is asked to write its short hand-off note while that is still cheap (about 2% of a 5-hour\nlimit). Only bigger chats that are still open, once each time they go quiet; you'll see the note\nmessage in that chat.");
+        Controls.AddRange(new Control[] { inLabel, inClaude, outLabel, outside, clockLabel, clock, launchLabel, launch, noteLabel, note, quietLabel, quiet });
 
         addBtn = MakeButton("+ Add account", P(130));
-        addBtn.Location = new Point(P(18), P(790));
+        addBtn.Location = new Point(P(18), P(866));
         // Adding an account opens it straight away on Claude's sign-in screen.
         addBtn.Click += (s, e) =>
         {
@@ -177,7 +192,7 @@ class ManageForm : Form
                 return Accounts.ShortcutName(a) + " added and opening: sign in to the new account there.";
             });
         };
-        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(788)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
+        status = new Label { ForeColor = Ui.Dim, AutoSize = false, Location = new Point(P(160), P(864)), Size = new Size(P(440), P(40)), TextAlign = ContentAlignment.MiddleLeft };
         Controls.AddRange(new Control[] { title, hint, list, hideLabel, hide, pinNote, autoLabel, auto, byLabel, by, capLabel, capWeek, orLabel, capFive, addBtn, status });
         Reload();
     }
@@ -188,7 +203,7 @@ class ManageForm : Form
     Button MakeChoice(string[] labels, int pick, int width, Action<int> save)
     {
         var b = MakeButton(labels[pick] + "  \u25BE", width); b.Height = P(28);
-        var menu = new ContextMenuStrip { Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()), ShowImageMargin = false, BackColor = Ui.Card, ForeColor = Ui.Text, Font = Font };
+        var menu = DarkMenuColors.NewMenu(Font);
         for (int i = 0; i < labels.Length; i++)
         {
             int idx = i;
@@ -207,7 +222,7 @@ class ManageForm : Form
 
     Button MakeButton(string text, int width)
     {
-        var b = new Button { Text = text, Width = width, Height = P(30), FlatStyle = FlatStyle.Flat, BackColor = Ui.Card, ForeColor = Ui.Text, Cursor = Cursors.Hand };
+        var b = new DarkButton { Text = text, Width = width, Height = P(30), FlatStyle = FlatStyle.Flat, BackColor = Ui.Card, ForeColor = Ui.Text, Cursor = Cursors.Hand };
         b.FlatAppearance.BorderColor = Ui.Line; b.FlatAppearance.MouseOverBackColor = Ui.Hover;
         return b;
     }
@@ -246,13 +261,13 @@ class ManageForm : Form
         var a = new AccountInfo { n = saved.n, name = saved.name, icon = saved.icon ?? "tint", color = saved.color, file = saved.file, appId = saved.appId };
         var row = new System.Windows.Forms.Panel { Width = P(570), Height = P(64), BackColor = Ui.Card, Margin = new Padding(P(4), P(3), P(4), P(3)) };
 
-        var pic = new PictureBox { Location = new Point(P(10), P(10)), Size = new Size(P(44), P(44)), SizeMode = PictureBoxSizeMode.Zoom };
+        var pic = new PictureBox { Location = new Point(P(24), P(10)), Size = new Size(P(44), P(44)), SizeMode = PictureBoxSizeMode.Zoom };
         var name = new TextBox
         {
-            Location = new Point(P(66), P(8)), Width = P(150), BackColor = Ui.Bg, ForeColor = Ui.Text, BorderStyle = BorderStyle.FixedSingle,
+            Location = new Point(P(76), P(8)), Width = P(144), BackColor = Ui.Bg, ForeColor = Ui.Text, BorderStyle = BorderStyle.FixedSingle,
             Text = string.IsNullOrWhiteSpace(a.name) ? "Account " + a.n : a.name
         };
-        var num = new Label { Text = a.n == 1 ? "Account 1 · normal Claude app" : "Account " + a.n, ForeColor = Ui.Faint, Location = new Point(P(66), P(38)), AutoSize = true, Font = new Font("Segoe UI", 8f) };
+        var num = new Label { Text = a.n == 1 ? "Account 1 · normal Claude app" : "Account " + a.n, ForeColor = Ui.Faint, Location = new Point(P(76), P(38)), AutoSize = true, Font = new Font("Segoe UI", 8f) };
         // Icon style: four small previews of this account's icon, click one to pick it.
         var tiles = new List<IconTile>();
         for (int i = 0; i < Kinds.Length; i++)
@@ -281,6 +296,15 @@ class ManageForm : Form
             Accounts.Save(st);
             status.ForeColor = Ui.Ok; status.Text = Accounts.ShortcutName(a) + (startup.Checked ? " will open when Windows starts." : " won't open by itself.");
         };
+
+        // Order: arrows move this account up or down in the panel and in this list.
+        var all = Accounts.All();
+        int at = all.FindIndex(x => x.n == a.n);
+        var up = MakeArrow("", at > 0); up.Location = new Point(P(2), P(8));
+        var down = MakeArrow("", at >= 0 && at < all.Count - 1); down.Location = new Point(P(2), P(34));
+        tip.SetToolTip(up, "Move up"); tip.SetToolTip(down, "Move down");
+        up.Click += (s, e) => Reorder(a, -1);
+        down.Click += (s, e) => Reorder(a, 1);
 
         Action refresh = () =>
         {
@@ -327,10 +351,38 @@ class ManageForm : Form
             Run("Removing…", () => { Accounts.Remove(a, signOut); return Accounts.ShortcutName(a) + " removed" + (signOut ? " and signed out." : "; its sign-in is kept."); });
         };
 
-        row.Controls.AddRange(new Control[] { pic, name, num, colour, picture, save, remove, startup });
+        row.Controls.AddRange(new Control[] { up, down, pic, name, num, colour, picture, save, remove, startup });
         row.Controls.AddRange(tiles.ToArray());
         refresh();
         return row;
+    }
+
+    Button MakeArrow(string glyph, bool enabled)
+    {
+        var b = new DarkButton
+        {
+            Text = glyph, Font = new Font("Segoe MDL2 Assets", 7.5f), Size = new Size(P(20), P(22)), FlatStyle = FlatStyle.Flat,
+            BackColor = Ui.Card, ForeColor = Ui.Dim, Visible = enabled, Cursor = Cursors.Hand, TabStop = false,   // no arrow where it can't move
+        };
+        b.FlatAppearance.BorderSize = 0; b.FlatAppearance.MouseOverBackColor = Ui.Hover;
+        return b;
+    }
+
+    // The list is rebuilt to show the new order, which would drop unsaved name or icon edits: save those first.
+    void Reorder(AccountInfo a, int step)
+    {
+        foreach (Control row in list.Controls)
+            foreach (Control c in row.Controls)
+                if (c is Button && c.Text == "Save" && c.Enabled)
+                {
+                    status.ForeColor = Ui.Warn; status.Text = "Save or undo your changes first, then move it.";
+                    return;
+                }
+        Accounts.MoveInOrder(a.n, step);
+        int scroll = list.VerticalScroll.Value;
+        Reload();
+        try { list.AutoScrollPosition = new Point(0, scroll); } catch { }
+        status.ForeColor = Ui.Ok; status.Text = "Order saved. The panel uses it from its next refresh.";
     }
 
     bool PickPicture(AccountInfo a)
@@ -350,6 +402,24 @@ class ManageForm : Form
             catch { a.file = fd.FileName; }
             return true;
         }
+    }
+}
+
+// A flat dark button whose greyed-out text stays readable. Windows draws a disabled button's text in
+// its own near-black grey, which disappears on the dark background, so that case is drawn here.
+class DarkButton : Button
+{
+    public static readonly Color DisabledText = Color.FromArgb(128, 125, 117);
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        if (Enabled) { base.OnPaint(e); return; }
+        var g = e.Graphics;
+        using (var b = new SolidBrush(BackColor)) g.FillRectangle(b, ClientRectangle);
+        if (FlatAppearance.BorderSize > 0)
+            using (var pen = new Pen(FlatAppearance.BorderColor.IsEmpty ? Ui.Line : FlatAppearance.BorderColor))
+                g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        TextRenderer.DrawText(g, Text, Font, ClientRectangle, DisabledText,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
     }
 }
 
@@ -394,6 +464,10 @@ class IconTile : Control
 // Dark colours for the small drop-down menu in the accounts window.
 class DarkMenuColors : ProfessionalColorTable
 {
+    public static ContextMenuStrip NewMenu(Font font)
+    {
+        return new ContextMenuStrip { Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()), ShowImageMargin = false, BackColor = Ui.Card, ForeColor = Ui.Text, Font = font };
+    }
     public override Color ToolStripDropDownBackground { get { return Ui.Card; } }
     public override Color MenuBorder { get { return Ui.Line; } }
     public override Color MenuItemBorder { get { return Ui.Hover; } }

@@ -18,6 +18,9 @@ static class Data
     static readonly string SessionsDir = Path.Combine(ClaudeDir, "sessions");
     static readonly string ProjectsDir = Path.Combine(ClaudeDir, "projects");
     public static readonly string BySessionDir = Path.Combine(ClaudeDir, "limits-tracker", "by-session");
+    // Hand-off notes the old chat writes about itself near its 5-hour limit (the limits plugin asks for them).
+    // Overridable for testing.
+    public static readonly string NotesDir = Environment.GetEnvironmentVariable("CLAUDE_TRACKER_NOTES_DIR") ?? Path.Combine(ClaudeDir, "limits-tracker", "handoff-notes");
     public static readonly string Local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
     public static readonly string AppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
     public static readonly string ClaudeExe = Path.Combine(Local, @"Microsoft\WindowsApps\claude-desktop.exe");
@@ -51,12 +54,63 @@ static class Data
     {
         lock (handedOffLock) try { File.AppendAllText(HandedOffFile, sid + Environment.NewLine); } catch { }
     }
+    // Every hand-off's text, by the old chat's id (overridable for testing).
+    public static readonly string HandoffsDir = Environment.GetEnvironmentVariable("CLAUDE_TRACKER_HANDOFFS_DIR") ?? Path.Combine(ClaudeDir, "handoffs");
+    // A move waits here until a new chat really starts with its text; only then does the old chat leave the panel.
+    static string PendingMovesDir { get { return Path.Combine(HandoffsDir, "pending"); } }
+    public static void SavePendingMove(string sid, string text)
+    {
+        Directory.CreateDirectory(PendingMovesDir);
+        File.WriteAllText(Path.Combine(PendingMovesDir, sid + ".md"), text);
+    }
+    // A move counts once a chat that started after it holds the old chat's id (the hand-off text names
+    // the old transcript or note, both of which carry it). Unsent moves are dropped after a day.
+    static void ConfirmMoves(List<Row> rows)
+    {
+        foreach (var p in SafeFiles(PendingMovesDir, "*.md"))
+        {
+            string sid = Path.GetFileNameWithoutExtension(p);
+            DateTime at;
+            try { at = File.GetLastWriteTimeUtc(p); } catch { continue; }
+            if (DateTime.UtcNow - at > TimeSpan.FromDays(1)) { try { File.Delete(p); } catch { } continue; }
+            foreach (var r in rows)
+            {
+                if (r.Sid == sid) continue;
+                DateTime created;
+                try { created = File.GetCreationTimeUtc(r.Path); } catch { continue; }
+                if (created < at.AddSeconds(-5) || !HeadContains(r.Path, sid)) continue;
+                try
+                {
+                    var dest = Path.Combine(HandoffsDir, sid + ".md");
+                    if (File.Exists(dest)) File.Delete(dest);
+                    File.Move(p, dest);   // keeps its time: the moment of the hand-off
+                }
+                catch { }
+                MarkHandedOff(sid);
+                break;
+            }
+        }
+    }
+    static bool HeadContains(string path, string needle)
+    {
+        try
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                var buf = new byte[(int)Math.Min(fs.Length, 256 * 1024)];
+                int n = fs.Read(buf, 0, buf.Length);
+                return Encoding.UTF8.GetString(buf, 0, n).Contains(needle);
+            }
+        }
+        catch { return false; }
+    }
+
     // sessionId -> when it was handed off. Every hand-off leaves its text in handoffs\<id>.md (also
     // ones from before handed-off.txt existed); the file's time is the hand-off time.
     static Dictionary<string, double> HandedOff()
     {
         var outp = new Dictionary<string, double>();
-        try { foreach (var p in SafeFiles(Path.Combine(ClaudeDir, "handoffs"), "*.md")) outp[Path.GetFileNameWithoutExtension(p)] = ToTs(File.GetLastWriteTimeUtc(p)); } catch { }
+        try { foreach (var p in SafeFiles(HandoffsDir, "*.md")) outp[Path.GetFileNameWithoutExtension(p)] = ToTs(File.GetLastWriteTimeUtc(p)); } catch { }
         lock (handedOffLock)
             try { foreach (var s in File.ReadAllLines(HandedOffFile)) if (s.Trim().Length > 0 && !outp.ContainsKey(s.Trim())) outp[s.Trim()] = double.MaxValue; } catch { }
         return outp;
@@ -749,6 +803,7 @@ static class Data
         var buckets = new Dictionary<string, Dictionary<string, List<Dictionary<string, object>>>>();
         Func<Dictionary<string, List<Dictionary<string, object>>>> newBucket = () => Cats.ToDictionary(c => c, c => new List<Dictionary<string, object>>());
         var flat = newBucket();
+        ConfirmMoves(rows);
         var handedOff = HandedOff();
 
         foreach (var r in rows)
@@ -805,6 +860,8 @@ static class Data
                 { "detail", Or(Str(summary, "needs_action"), Str(summary, "status_detail")) },
                 { "note", note },
                 { "limited", r.A.LastKind == "limit" },
+                // The chat wrote its own hand-off note (near its limit, or for the hand-off button): green dot.
+                { "noteReady", NoteFor(r.Sid, r.F.Mtime) != null },
             };
             if (host != null && Str(rec, "_root") != null)
                 index[r.Sid] = new KeyValuePair<string, string>("claude://claude.ai/epitaxy/" + host, Str(rec, "_root"));
@@ -877,7 +934,7 @@ static class Data
             foreach (var c in Cats) acct[c] = buckets["unknown"][c].OrderByDescending(x => (double)x["lastActivity"]).Cast<object>().ToArray();
             accounts.Add(acct);
         }
-        accounts = accounts.OrderBy(a => (int)a["n"]).ToList();
+        accounts = accounts.OrderBy(a => Accounts.Rank(settings, (int)a["n"])).ToList();   // your chosen order; "Other" (100) last
         var newest = accounts.Where(a => (string)a["source"] == "live").OrderByDescending(a => Dbl(a["asOf"]) ?? 0).FirstOrDefault();
         if (newest != null) newest["current"] = true;
 
@@ -1152,6 +1209,9 @@ static class Data
 
     // Whether "Trust this workspace?" was already answered yes for this folder (or a folder above it).
     // Unknown counts as not trusted.
+    // Claude's settings can list one folder twice, spelled with \ and with /, and the two can disagree
+    // (an old yes under one spelling, "not yet" under the other). Claude then asks again, so any entry
+    // for the folder itself that isn't a yes counts as "it may ask".
     public static bool IsTrustedFolder(string folder)
     {
         try
@@ -1161,11 +1221,15 @@ static class Data
             if (projects == null) return false;
             Func<string, string> Norm = s => s.Replace('/', '\\').TrimEnd('\\').ToLowerInvariant();
             var want = Norm(Path.GetFullPath(folder));
+            bool yes = false;
             foreach (var kv in projects)
             {
                 var k = Norm(kv.Key);
-                if ((want == k || want.StartsWith(k + "\\")) && Truthy(Get(kv.Value as Dictionary<string, object>, "hasTrustDialogAccepted"))) return true;
+                bool trusted = Truthy(Get(kv.Value as Dictionary<string, object>, "hasTrustDialogAccepted"));
+                if (want == k && !trusted) return false;
+                if ((want == k || want.StartsWith(k + "\\")) && trusted) yes = true;
             }
+            return yes;
         }
         catch { }
         return false;
@@ -1173,6 +1237,78 @@ static class Data
 
     // ---------- hand off ----------
     static readonly Regex NoteTags = new Regex(@"<(system-reminder|local-command[a-z-]*|command-[a-z-]+)>.*?</\1>", RegexOptions.Singleline);
+
+    // The hand-off note the chat wrote about itself, if there is one that still fits it: written in the
+    // last 5 hours of the chat's activity (an older one belongs to an earlier stretch of work).
+    public static string NoteFor(string sid, DateTime? chatLastWrite = null)
+    {
+        try
+        {
+            var p = Path.Combine(NotesDir, sid + ".md");
+            var nf = new FileInfo(p);
+            if (!nf.Exists || nf.Length == 0) return null;
+            DateTime last = chatLastWrite ?? DateTime.MinValue;
+            if (chatLastWrite == null)
+                foreach (var dir in SafeDirs(ProjectsDir))
+                {
+                    var cand = new FileInfo(Path.Combine(dir, sid + ".jsonl"));
+                    if (cand.Exists) { last = cand.LastWriteTimeUtc; break; }
+                }
+            return last - nf.LastWriteTimeUtc > TimeSpan.FromHours(5) ? null : p;
+        }
+        catch { return null; }
+    }
+
+    static FileInfo TranscriptOf(string sid)
+    {
+        foreach (var dir in SafeDirs(ProjectsDir))
+        {
+            var cand = new FileInfo(Path.Combine(dir, sid + ".jsonl"));
+            if (cand.Exists) return cand;
+        }
+        return null;
+    }
+
+    // Before the hand-off button moves a chat, it can ask the chat to write its own note first.
+    // Returns why not (then it moves straight away), or null when asking makes sense:
+    //   "note"   - a note written after the chat's last activity is already there;
+    //   "old"    - quiet for over an hour: Claude no longer remembers it cheaply, so reading it all
+    //              back in to write a note costs more than the new chat reading the transcript;
+    //   "closed" - the chat isn't running in the background, so nothing would see the request;
+    //   "full"   - its account has too little of its 5-hour limit left to write one.
+    public static string WhyNotAskForNote(string sid)
+    {
+        var t = TranscriptOf(sid);
+        if (t == null) return "nochat";
+        var note = new FileInfo(Path.Combine(NotesDir, sid + ".md"));
+        if (note.Exists && note.Length > 0 && note.LastWriteTimeUtc >= t.LastWriteTimeUtc.AddMinutes(-2)) return "note";
+        if (DateTime.UtcNow - t.LastWriteTimeUtc > TimeSpan.FromHours(1)) return "old";
+        Dictionary<string, object> info;
+        if (!LiveSessions().TryGetValue(sid, out info) || !Truthy(Get(info, "alive"))) return "closed";
+        var reading = ReadJson(Path.Combine(BySessionDir, sid + ".json"));
+        var five = (Get(reading, "rateLimits") as object[] ?? new object[0]).OfType<Dictionary<string, object>>().FirstOrDefault(l => Str(l, "kind") == "five_hour");
+        if ((Dbl(Get(five, "percentUsed")) ?? 0) >= 99) return "full";
+        return null;
+    }
+
+    // Leaves the request the limits plugin in that chat picks up within a few seconds.
+    // why: "move" (the hand-off button) or "quiet" (nearly an hour without activity); the plugin words its ask by it.
+    public static DateTime AskForNote(string sid, string why = "move")
+    {
+        var now = DateTime.UtcNow;
+        Directory.CreateDirectory(NotesDir);
+        File.WriteAllText(Path.Combine(NotesDir, sid + ".request.json"), "{\"at\":" + (long)(now - new DateTime(1970, 1, 1)).TotalMilliseconds + ",\"why\":\"" + why + "\"}");
+        return now;
+    }
+    public static bool NoteWrittenSince(string sid, DateTime since)
+    {
+        var note = new FileInfo(Path.Combine(NotesDir, sid + ".md"));
+        return note.Exists && note.Length > 0 && note.LastWriteTimeUtc >= since.AddSeconds(-1);
+    }
+    public static void DropNoteRequest(string sid)
+    {
+        try { File.Delete(Path.Combine(NotesDir, sid + ".request.json")); } catch { }
+    }
 
     public static string HandoffText(string sid, out string cwd)
     {
@@ -1217,6 +1353,32 @@ static class Data
         sb.Append("I'm moving a conversation over from another of my Claude accounts. Please pick it up where it left off.\n\n");
         sb.Append("Conversation: " + title + "\n");
         if (cwd.Length > 0) sb.Append("Folder it was working in: " + cwd + "\n");
+
+        // The old chat's own hand-off note, when it wrote one near its 5-hour limit: it carries the
+        // decisions and state, which the raw end of the transcript often doesn't.
+        string notePath = NoteFor(sid, fi.LastWriteTimeUtc);
+        if (notePath != null)
+        {
+            string note = "";
+            try { note = File.ReadAllText(notePath, Encoding.UTF8).Trim(); } catch { }
+            // The old chat kept working a little after writing the note: say so, so the new one checks the end.
+            bool wentOn = (fi.LastWriteTimeUtc - new FileInfo(notePath).LastWriteTimeUtc).TotalMinutes > 2;
+            string after = wentOn ? "The old chat kept going for a bit after writing the note, so check the end of the transcript for the last steps.\n" : "";
+            string fallback = "If something you need is missing from the note, the full transcript is here (one JSON message per line, newest at the bottom): " + path + "\n\n";
+            var withNote = new StringBuilder(sb.ToString());
+            withNote.Append("\nThe old chat wrote this hand-off note itself just before the move. It holds the goal, what was decided and why, what is done and half-done, and the next step:\n\n");
+            withNote.Append("----- hand-off note -----\n" + note + "\n----- end of note -----\n\n");
+            withNote.Append(after + fallback);
+            withNote.Append("Tell me in a few lines where things stand, then carry on from the note's next step.");
+            // The text travels in a link to the Claude app, and Windows caps that at about 32,000 characters.
+            if (note.Length > 0 && Uri.EscapeDataString(withNote.ToString()).Length < 24000) return withNote.ToString();
+            sb.Append("\nThe old chat wrote a hand-off note itself just before the move: " + notePath + "\n");
+            sb.Append("Read that note first: it holds the goal, what was decided and why, what is done and half-done, and the next step.\n");
+            sb.Append(after + fallback);
+            sb.Append("Then tell me in a few lines where things stand and carry on from the note's next step.");
+            return sb.ToString();
+        }
+
         sb.Append("Full transcript (one JSON message per line, newest at the bottom): " + path + "\n\n");
         sb.Append("Read the end of the transcript first (the last few hundred lines are usually enough) to see what was asked, what was done, and what is still open. Then tell me in a few lines where things stand and carry on.\n\n");
         sb.Append("The last messages were:\n\n" + string.Join("\n\n", said.Select(s => s.Value)));

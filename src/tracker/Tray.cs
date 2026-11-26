@@ -101,6 +101,7 @@ static class ClaudeTray
             // Sample conversations shown as open in their account's window (and the one in front).
             Func<string, HashSet<string>> ids = key => { var h = new HashSet<string>(); object v; if (State.TryGetValue(key, out v) && v is object[]) foreach (var o in (object[])v) h.Add((string)o); return h; };
             Data.OnScreen = ids("onScreen"); Data.OnScreenFront = ids("onScreenFront");
+            Hint = SuggestAccount(State, Num(State["now"]));
             panel = new Panel { Location = new Point(-5000, -5000) };
             if (args.Length > 4) panel.Size = new Size(int.Parse(args[3]), int.Parse(args[4]));
             panel.Show(); Application.DoEvents();
@@ -211,14 +212,6 @@ static class ClaudeTray
     // Room counts for more when the limit resets soon: what's left is spread over the hours left and
     // compared with an even pace over the whole period. With the whole period left, it's just the percent used.
     // No reading counts as half used.
-    static double Paced(double used, double reset, double now, double periodHours)
-    {
-        if (double.IsNaN(used)) return 50;
-        if (double.IsNaN(reset)) return used;
-        double hoursLeft = Math.Min(periodHours, Math.Max(periodHours / 300, (reset - now) / 3600));
-        return Math.Max(0, 100 - Math.Min(100, (100 - used) * periodHours / hoursLeft));
-    }
-
     public static double ResetAt(Dictionary<string, object> acct, string kind)
     {
         if (acct == null) return double.NaN;
@@ -252,8 +245,38 @@ static class ClaudeTray
 
         double now = Num(d["now"]);
 
+        Hint = SuggestAccount(d, now);
         AutoHandoff(d, now);
+        NoteBeforeForgotten(d, now);
         KeepClock(d, now);
+    }
+
+    // ---------- a hand-off note before Claude forgets a quiet chat ----------
+    // Claude keeps a chat in its short-term memory for an hour after its last activity; after that,
+    // carrying on means reading the whole chat back in at full price. So a chat left quiet for 55
+    // minutes is asked to write its hand-off note while that is still cheap (the same note the
+    // hand-off button and the 5-hour stop use). Only bigger chats, once per quiet stretch.
+    const double QuietFrom = 55 * 60, QuietUntil = 58 * 60, QuietMinContext = 40000;
+    static readonly HashSet<string> askedWhileQuiet = new HashSet<string>();
+    static void NoteBeforeForgotten(Dictionary<string, object> d, double now)
+    {
+        if (!Accounts.Load().noteBeforeForgotten) return;
+        foreach (Dictionary<string, object> acct in Arr(d, "accounts"))
+            foreach (var cat in new[] { "unseen", "waiting", "pinned" })
+                foreach (Dictionary<string, object> it in Arr(acct, cat))
+                {
+                    var sid = it["sessionId"] as string;
+                    if (sid == null || (it["state"] as string) == "working" || (it["state"] as string) == "background") continue;
+                    double last = Num(it["lastActivity"]), quiet = now - last;
+                    if (double.IsNaN(last) || quiet < QuietFrom || quiet > QuietUntil) continue;
+                    if (!(it["ctx"] is double || it["ctx"] is int) || Convert.ToDouble(it["ctx"]) < QuietMinContext) continue;
+                    var key = sid + "|" + (long)last;
+                    if (!askedWhileQuiet.Add(key)) continue;
+                    string why = null;
+                    try { why = Data.WhyNotAskForNote(sid); } catch { why = "error"; }
+                    if (why != null) continue;   // already has a note, not running, or its account is nearly full
+                    try { Data.AskForNote(sid, "quiet"); } catch { }
+                }
     }
 
     // ---------- starting each account's 5-hour clock ----------
@@ -363,7 +386,7 @@ static class ClaudeTray
                     if (handedOff.Contains(sid)) continue;
                     // Only fresh ones: a limit hit more than 15 minutes ago was already seen.
                     if (now - Num(it["lastActivity"]) > 15 * 60) { Remember(sid); continue; }
-                    var to = BestAccount(d, from, now);
+                    var to = SuggestAccount(d, now, from);   // the same pick the hand-off card suggests
                     if (to == null) continue;   // nowhere better to go right now; try again next refresh
                     Remember(sid);
                     int n = Convert.ToInt32(to["n"]);
@@ -394,27 +417,41 @@ static class ClaudeTray
         try { File.WriteAllLines(HandedOffFile, handedOff.ToArray()); } catch { }
     }
 
-    // The account with the most room left (by weekly, 5-hour or both, as chosen in settings),
-    // skipping any account past the chosen weekly / 5-hour ceiling.
-    static Dictionary<string, object> BestAccount(Dictionary<string, object> d, int from, double now)
+    // ---------- which account to use next ----------
+    // The panel's hint, the hand-off card's suggestion, and where a chat that hits its limit is moved. Skips accounts that are full (past the hand-off ceilings), counts the chats
+    // already running on each (each is expected to take about RunningChatCost% of its 5 hours soon), then prefers
+    // the account whose weekly room is most at risk of going unused before its weekly reset. Close calls go to
+    // the account whose 5-hour limit resets sooner. Null when fewer than two accounts can be opened.
+    public static Dictionary<string, object> Hint;
+    const double RunningChatCost = 10;
+    // exclude: the account a chat is on now, when picking where that chat should go.
+    public static Dictionary<string, object> SuggestAccount(Dictionary<string, object> d, double now, int exclude = -1)
     {
         var st = Accounts.Load();
-        string by = st.handoffPickBy ?? "both";
-        Dictionary<string, object> best = null; double bestScore = double.MaxValue;
+        int startable = 0;
+        Dictionary<string, object> best = null; double bestUrg = -1, bestReset = double.MaxValue;
         foreach (Dictionary<string, object> a in Arr(d, "accounts"))
         {
             int n = Convert.ToInt32(a["n"]);
-            if (n == from || n == 99 || !(a["canStart"] is bool && (bool)a["canStart"])) continue;
+            if (n >= 99 || !(a["canStart"] is bool && (bool)a["canStart"])) continue;
+            startable++;
+            if (n == exclude) continue;
             if (a["cutResetsAt"] != null && Num(a["cutResetsAt"]) > now) continue;
             double five = Pct(a, "five_hour"), week = Pct(a, "seven_day");
+            double fiveReset = ResetAt(a, "five_hour"), weekReset = ResetAt(a, "seven_day");
+            // A window that already reset is empty; no reading counts as half used.
+            if (!double.IsNaN(fiveReset) && fiveReset <= now) five = 0; else if (double.IsNaN(five)) five = 50;
+            if (!double.IsNaN(weekReset) && weekReset <= now) week = 0; else if (double.IsNaN(week)) week = 50;
             if (five >= Math.Min(100, st.handoffMaxFive) || week >= Math.Min(100, st.handoffMaxWeekly)) continue;
-            // No reading yet counts as half used: better than a busy account, worse than a known quiet one.
-            double f = Paced(five, ResetAt(a, "five_hour"), now, 5);
-            double w = Paced(week, ResetAt(a, "seven_day"), now, 168);
-            double score = by == "weekly" ? w + f / 1000 : by == "five" ? f + w / 1000 : Math.Max(f, w);
-            if (score < bestScore) { bestScore = score; best = a; }
+            double room = 100 - five - RunningChatCost * Arr(a, "working").Length;
+            if (room < 10) continue;
+            double hoursToWeek = double.IsNaN(weekReset) || weekReset <= now ? 168 : Math.Max(1, Math.Min(168, (weekReset - now) / 3600));
+            double urg = (100 - week) / hoursToWeek;
+            double fr = double.IsNaN(fiveReset) || fiveReset <= now ? now + 5 * 3600 : fiveReset;
+            bool better = best == null || urg > bestUrg * 1.1 || (urg * 1.1 >= bestUrg && fr < bestReset);
+            if (better) { best = a; bestUrg = urg; bestReset = fr; }
         }
-        return best;
+        return startable < 2 ? null : best;
     }
 
     // ---------- icon ----------
@@ -473,33 +510,81 @@ static class ClaudeTray
     public static void LaunchAccount(int n) { Act(() => Data.LaunchAccount(n), "Couldn't open that account."); }
     public static void OpenConversation(string sid) { Act(() => Data.OpenConversation(sid), "Couldn't find that conversation in Claude."); }
     public static void Mark(string sid, string action) { Act(() => Marks.Set(sid, action), null); }
-    public static void Handoff(string sid, int n, bool send = false, string doneTitle = null)
+
+    // The hand-off button: when the chat was active in the last hour and is still running, it first
+    // writes its own hand-off note (the limits plugin asks it), then moves with that note. Otherwise,
+    // or if no note comes within a few minutes, it moves straight away as before.
+    static readonly HashSet<string> waitingForNote = new HashSet<string>();
+    const int NoteWaitSeconds = 270;
+    public static void HandoffAfterNote(string sid, int n)
+    {
+        if (waitingForNote.Contains(sid))
+        {
+            tray.ShowBalloonTip(4000, "Still writing the note", "This chat is writing its hand-off note. It moves as soon as the note is saved.", ToolTipIcon.Info);
+            return;
+        }
+        string why = null;
+        try { why = Data.WhyNotAskForNote(sid); } catch { why = "error"; }
+        if (why != null) { Handoff(sid, n, true); return; }
+        DateTime asked;
+        try { asked = Data.AskForNote(sid); } catch { Handoff(sid, n, true); return; }
+        waitingForNote.Add(sid);
+        tray.ShowBalloonTip(6000, "Writing a hand-off note first", "The chat is writing a short note about where it stands. It moves to the new account as soon as the note is saved.", ToolTipIcon.Info);
+        var started = DateTime.UtcNow;
+        var timer = new System.Windows.Forms.Timer { Interval = 2000 };
+        timer.Tick += (s, e) =>
+        {
+            bool done = Data.NoteWrittenSince(sid, asked);
+            bool late = (DateTime.UtcNow - started).TotalSeconds > NoteWaitSeconds;
+            if (!done && !late) return;
+            timer.Stop(); timer.Dispose();
+            waitingForNote.Remove(sid);
+            Data.DropNoteRequest(sid);
+            if (!done) tray.ShowBalloonTip(6000, "No note came", "The chat didn't write its note in time, so it moves with its transcript instead.", ToolTipIcon.Info);
+            Handoff(sid, n, true);
+        };
+        timer.Start();
+    }
+
+    public static void Handoff(string sid, int n, bool send = false, string doneTitle = null, bool fallback = false)
     {
         string cwd;
         string text = null;
         try { text = Data.HandoffText(sid, out cwd); } catch { cwd = null; }
         if (text == null) { tray.ShowBalloonTip(3000, "Claude Tracker", "Couldn't read that conversation.", ToolTipIcon.Warning); return; }
         try { Clipboard.SetText(text); } catch { }   // backup in case the text doesn't land in the new chat
-        try
-        {
-            var dir = Path.Combine(Data.ClaudeDir, "handoffs");
-            Directory.CreateDirectory(dir);
-            File.WriteAllText(Path.Combine(dir, sid + ".md"), text);
-        }
-        catch { }
+        // Kept as pending: the old chat stays in the panel until a new chat really starts with this text
+        // (Data.ConfirmMoves); if you never send it, nothing disappears.
+        try { Data.SavePendingMove(sid, text); } catch { }
         // A chat with no project folder runs in a temporary folder made just for it (deleted with it).
         // Carrying that over makes Claude ask "Trust this workspace?" for a folder nobody chose, so the
         // new chat gets its own temporary folder instead.
         string folder = Data.IsTempWorkspace(cwd) ? null : cwd;
-        // Never press Enter for you while Claude may be asking whether to trust the folder: that answer is yours.
-        bool askTrust = folder != null && !Data.IsTrustedFolder(folder);
+        // A new chat opened from outside the app in a folder always asks "Trust this workspace?", even for a
+        // folder you trusted before, with or without a message (checked on accounts 2 and 3). So for a chat
+        // with a folder the tracker works the app itself: new chat (it opens in the account's last folder),
+        // paste, send, and the hand-off tells the new chat to move itself to the right folder if needed.
+        // Only if that can't get the window in front does it fall back to the link and your Trust click.
+        if (folder != null && !fallback)
+        {
+            string moved = "First: this work belongs in the folder " + folder + ". If this chat's working folder is a different one, " +
+                           "move this chat there with your change-directory tool before anything else.\n\n" + text;
+            AllowSetForegroundWindow(-1);
+            AutoSend.NewChatAndPaste(n, panel, moved, send, ok =>
+            {
+                if (!ok) Handoff(sid, n, send, doneTitle, true);
+                else try { Clipboard.SetText(moved); } catch { }   // backup, as on the other path
+                Fetch();
+            });
+            return;
+        }
+        bool askTrust = folder != null;
         if (askTrust) send = false;
         Act(() =>
         {
             bool ok = Data.StartConversation(n, text, folder);
-            if (ok) Data.MarkHandedOff(sid);
             if (ok && askTrust)
-                try { panel.BeginInvoke((Action)(() => tray.ShowBalloonTip(8000, "Check the new chat", "Claude is asking whether to trust " + folder + ". Answer it, then press Enter to send the hand-off.", ToolTipIcon.Info))); } catch { }
+                try { panel.BeginInvoke((Action)(() => tray.ShowBalloonTip(10000, "Trust the folder, then press Enter", "Claude asks you to trust " + folder + " for the new chat (it always does for a chat opened from outside the app). Click Trust workspace, then press Enter to send the hand-off. The old chat stays in the panel until the new one starts.", ToolTipIcon.Info))); } catch { }
             if (ok && send)
                 AutoSend.Run(n, panel, sent =>
                 {
@@ -576,10 +661,9 @@ static class Ui
     }
     public static string Dur(double sec)
     {
-        double s = Math.Max(0, sec);
-        int d = (int)(s / 86400); s -= d * 86400;
-        int h = (int)(s / 3600); s -= h * 3600;
-        int m = (int)Math.Ceiling(s / 60);
+        // Round up to whole minutes first, so 1h 59m 30s reads "2h 0m", not "1h 60m".
+        long t = (long)Math.Ceiling(Math.Max(0, sec) / 60);
+        long d = t / 1440, h = t % 1440 / 60, m = t % 60;
         if (d > 0) return d + "d " + h + "h";
         if (h > 0) return h + "h " + m + "m";
         return m + "m";
@@ -630,7 +714,7 @@ class Panel : Form
         host.Controls.Add(Board);
         host.Resize += (s, e) => { if (!anim.Enabled) Board.Width = host.ClientSize.Width; };   // no re-wrapping mid-animation
         Board.SizeChanged += (s, e) => host.Clamp();
-        Board.MouseWheel += (s, e) => host.ScrollBy(e.Delta / 2);
+        Board.MouseWheel += (s, e) => { if ((ModifierKeys & Keys.Control) != 0) Board.ZoomBy(e.Delta); else host.ScrollBy(e.Delta / 2); };
         Board.Width = expandedSize.Width - P(20);
 
         // The bottom bar: how the panel behaves in a Claude window and elsewhere, one click to switch each.
@@ -1502,7 +1586,11 @@ class ScrollHost : Control
         offset = Math.Max(min, Math.Min(0, offset));
         if (b.Top != offset) b.Top = offset;
     }
-    protected override void OnMouseWheel(MouseEventArgs e) { ScrollBy(e.Delta / 2); }
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        if ((ModifierKeys & Keys.Control) != 0) { if (Controls.Count > 0 && Controls[0] is Board) ((Board)Controls[0]).ZoomBy(e.Delta); }
+        else ScrollBy(e.Delta / 2);
+    }
     protected override void OnResize(EventArgs e) { base.OnResize(e); Clamp(); }
 }
 
@@ -1519,16 +1607,41 @@ class Board : DoubleBufferedControl
     {
         this.owner = owner;
         BackColor = Ui.Bg;
-        fName = new Font("Segoe UI Semibold", 10f);
-        fTitle = new Font("Segoe UI", 9.5f);
-        fTitleBold = new Font("Segoe UI Semibold", 9.5f);
-        fSmall = new Font("Segoe UI", 8.5f);
-        fTiny = new Font("Segoe UI", 7.5f);
-        fLabel = new Font("Segoe UI Semibold", 7f);
+        try { zoom = Math.Max(MinZoom, Math.Min(MaxZoom, float.Parse(File.ReadAllText(ZoomFile).Trim(), System.Globalization.CultureInfo.InvariantCulture))); } catch { }
+        MakeFonts();
         Height = 100;
     }
 
-    int P(float v) { return owner.P(v); }
+    // Ctrl + mouse wheel makes the list's text and rows bigger or smaller; remembered between runs.
+    const float MinZoom = 0.8f, MaxZoom = 2f;
+    float zoom = 1f;
+    int lastZoomTick;
+    static string ZoomFile { get { return Path.Combine(ClaudeTray.Dir, "zoom.txt"); } }
+    void MakeFonts()
+    {
+        foreach (var f in new[] { fName, fTitle, fTitleBold, fSmall, fTiny, fLabel, fIcon, fIconSmall }) if (f != null) f.Dispose();
+        fName = new Font("Segoe UI Semibold", 10f * zoom);
+        fTitle = new Font("Segoe UI", 9.5f * zoom);
+        fTitleBold = new Font("Segoe UI Semibold", 9.5f * zoom);
+        fSmall = new Font("Segoe UI", 8.5f * zoom);
+        fTiny = new Font("Segoe UI", 7.5f * zoom);
+        fLabel = new Font("Segoe UI Semibold", 7f * zoom);
+        fIcon = new Font("Segoe MDL2 Assets", 9f * zoom); fIconSmall = new Font("Segoe MDL2 Assets", 7f * zoom);
+    }
+    public void ZoomBy(int delta)
+    {
+        // The same wheel turn can reach both the list and the area holding it: count it once.
+        if (unchecked(Environment.TickCount - lastZoomTick) < 40) return;
+        lastZoomTick = Environment.TickCount;
+        float z = (float)Math.Round(Math.Max(MinZoom, Math.Min(MaxZoom, zoom + (delta > 0 ? 0.1f : -0.1f))), 1);
+        if (z == zoom) return;
+        zoom = z;
+        MakeFonts();
+        try { File.WriteAllText(ZoomFile, zoom.ToString(System.Globalization.CultureInfo.InvariantCulture)); } catch { }
+        Invalidate();
+    }
+
+    int P(float v) { return owner.P(v * zoom); }
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
@@ -1626,7 +1739,9 @@ class Board : DoubleBufferedControl
         TextRenderer.DrawText(g, name, fName, new Point(x, y), Ui.Text, TextFormatFlags.NoPadding);
         int nx = x + TextRenderer.MeasureText(g, name, fName, Size.Empty, TextFormatFlags.NoPadding).Width + P(8);
         object cur;
-        if (a.TryGetValue("current", out cur) && cur is bool && (bool)cur)
+        int buttonsLeft = Convert.ToInt32(a["n"]) < 99 ? x + w - P(58) - P(62) : x + w;
+        // Bigger text on a narrow panel: leave the tag out rather than draw it over the buttons.
+        if (a.TryGetValue("current", out cur) && cur is bool && (bool)cur && nx + P(46) <= buttonsLeft - P(4))
         {
             var r = new Rectangle(nx, y + P(2), P(46), P(16));
             using (var p = Ui.Rounded(r, P(8))) using (var b = new SolidBrush(Color.FromArgb(45, 58, 40))) g.FillPath(b, p);
@@ -1694,7 +1809,7 @@ class Board : DoubleBufferedControl
         if (!any) TextRenderer.DrawText(g, "No active conversations", fSmall, new Point(x, y + P(2)), Ui.Faint, TextFormatFlags.NoPadding);
     }
 
-    static readonly Font fIcon = new Font("Segoe MDL2 Assets", 9f), fIconSmall = new Font("Segoe MDL2 Assets", 7f);
+    Font fIcon, fIconSmall;
     void DrawIconBtn(Graphics g, Rectangle r, string kind, Action click)
     {
         bool hov = r.Contains(mouse);
@@ -1716,18 +1831,7 @@ class Board : DoubleBufferedControl
 
     void ShowHandoffMenu(string sid, Rectangle at)
     {
-        var menu = new ContextMenuStrip();
-        foreach (Dictionary<string, object> a in ClaudeTray.Arr(ClaudeTray.State, "accounts"))
-        {
-            int n = Convert.ToInt32(a["n"]);
-            if (n >= 99 || !(a["canStart"] is bool && (bool)a["canStart"])) continue;
-            int nn = n;
-            menu.Items.Add("Continue in a new chat on " + (string)a["name"], null, (s, e) => ClaudeTray.Handoff(sid, nn));
-        }
-        if (menu.Items.Count == 0) menu.Items.Add("No accounts can be opened").Enabled = false;
-        menu.Opened += (s, e) => Panel.MenusOpen++;
-        menu.Closed += (s, e) => Panel.MenusOpen = Math.Max(0, Panel.MenusOpen - 1);
-        menu.Show(this, new Point(at.Left, at.Bottom));
+        new HandoffPicker(sid).ShowAt(this, at);
     }
 
     int DrawRow(Graphics g, Dictionary<string, object> it, string key, int x, int y, int w)
@@ -1755,10 +1859,11 @@ class Board : DoubleBufferedControl
         if (realKey == "background") realKey = "working";
         bool rowHover = r.Contains(mouse);
         string sid = it.ContainsKey("sessionId") ? it["sessionId"] as string : null;
-        // dot
+        // dot: yellow when it's yours to look at, green instead once the chat has written its hand-off note
+        Color yours = it.ContainsKey("noteReady") && it["noteReady"] is bool && (bool)it["noteReady"] ? Ui.Ok : Ui.Warn;
         int dx = x + P(9), dy = y + P(11);
         var dotR = new RectangleF(dx, dy, P(7), P(7));
-        if (realKey == "idle") using (var pen = new Pen(Ui.Faint, 1.5f * owner.S)) g.DrawEllipse(pen, dotR);
+        if (realKey == "idle") using (var pen = new Pen(Ui.Faint, 1.5f * owner.S * zoom)) g.DrawEllipse(pen, dotR);
         else if (realKey == "working" && background)
             using (var b = new SolidBrush(Ui.Blue)) g.FillEllipse(b, dotR);
         else if (realKey == "working")
@@ -1768,10 +1873,10 @@ class Board : DoubleBufferedControl
         }
         else if (realKey == "unseen")
         {
-            using (var b = new SolidBrush(Color.FromArgb(50, Ui.Warn))) g.FillEllipse(b, dx - P(3), dy - P(3), P(13), P(13));
-            using (var b = new SolidBrush(Ui.Warn)) g.FillEllipse(b, dotR);
+            using (var b = new SolidBrush(Color.FromArgb(50, yours))) g.FillEllipse(b, dx - P(3), dy - P(3), P(13), P(13));
+            using (var b = new SolidBrush(yours)) g.FillEllipse(b, dotR);
         }
-        else if (realKey == "waiting") using (var pen = new Pen(Ui.Warn, 1.5f * owner.S)) g.DrawEllipse(pen, dotR);
+        else if (realKey == "waiting") using (var pen = new Pen(yours, 1.5f * owner.S * zoom)) g.DrawEllipse(pen, dotR);
         else using (var b = new SolidBrush(Ui.Bad)) g.FillEllipse(b, dotR);
 
         int tx = x + P(24), tw = w - P(24) - P(56);
