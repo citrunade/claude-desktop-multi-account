@@ -1294,15 +1294,51 @@ static class Data
     {
         var t = TranscriptOf(sid);
         if (t == null) return "nochat";
+        // Opening or resuming a chat writes bookkeeping lines into its file without any real message,
+        // so go by the last message you or Claude actually wrote, not by when the file changed.
+        DateTime last = LastMessageUtc(t.FullName) ?? t.LastWriteTimeUtc;
         var note = new FileInfo(Path.Combine(NotesDir, sid + ".md"));
-        if (note.Exists && note.Length > 0 && note.LastWriteTimeUtc >= t.LastWriteTimeUtc.AddMinutes(-2)) return "note";
-        if (DateTime.UtcNow - t.LastWriteTimeUtc > TimeSpan.FromHours(1)) return "old";
+        if (note.Exists && note.Length > 0 && note.LastWriteTimeUtc >= last.AddMinutes(-2)) return "note";
+        if (DateTime.UtcNow - last > TimeSpan.FromHours(1)) return "old";
         Dictionary<string, object> info;
         if (!LiveSessions().TryGetValue(sid, out info) || !Truthy(Get(info, "alive"))) return "closed";
         var reading = ReadJson(Path.Combine(BySessionDir, sid + ".json"));
         var five = (Get(reading, "rateLimits") as object[] ?? new object[0]).OfType<Dictionary<string, object>>().FirstOrDefault(l => Str(l, "kind") == "five_hour");
         if ((Dbl(Get(five, "percentUsed")) ?? 0) >= 99) return "full";
         return null;
+    }
+
+    // When the chat last had a real message: yours or Claude's, not a side helper's, not setup text.
+    // The plugin's own note asks, Claude's answers to them and a stop with Esc don't count.
+    static DateTime? LastMessageUtc(string path)
+    {
+        DateTime? last = null, ask = null;
+        foreach (var line in TailLines(path, TailBytes))
+        {
+            if (!line.StartsWith("{") || !(line.Contains("\"type\":\"assistant\"") || line.Contains("\"type\":\"user\""))) continue;
+            Dictionary<string, object> e;
+            try { e = Json.DeserializeObject(line) as Dictionary<string, object>; } catch { continue; }
+            if (e == null || Truthy(Get(e, "isSidechain")) || Truthy(Get(e, "isMeta"))) continue;
+            string type = Str(e, "type");
+            if (type != "assistant" && type != "user") continue;
+            var ts = Get(e, "timestamp") as string;
+            DateTime dt;
+            if (ts == null || !DateTime.TryParse(ts, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out dt)) continue;
+            if (type == "user")
+            {
+                var msg = Obj(e, "message");
+                var content = Get(msg, "content") as object[];
+                string text = Get(msg, "content") as string ?? (content == null ? null : string.Concat(content.OfType<Dictionary<string, object>>().Select(c => Str(c, "text"))));
+                if (text != null && text.StartsWith("The limits-beacon plugin sent a message")) { ask = dt; continue; }
+                if (text != null && text.StartsWith("[Request interrupted by user")) continue;
+                bool toolResult = content != null && content.Any(c => c is Dictionary<string, object> && Str((Dictionary<string, object>)c, "type") == "tool_result");
+                if (!toolResult) ask = null;   // you wrote something yourself
+            }
+            if (ask != null && dt - ask.Value < TimeSpan.FromMinutes(10)) continue;   // Claude working on the note
+            last = dt;
+        }
+        return last;
     }
 
     // Leaves the request the limits plugin in that chat picks up within a few seconds.

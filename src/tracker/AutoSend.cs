@@ -15,7 +15,13 @@ static class AutoSend
         {
             Thread.Sleep(3500);   // let the new chat load and fill in the message
             IntPtr win = Data.AccountWindow(n);
-            if (win == IntPtr.Zero) { Report(ui, done, false); return; }
+            // An account that wasn't open is still starting: wait for its window, then for it to load.
+            if (win == IntPtr.Zero)
+            {
+                for (int i = 0; i < 60 && win == IntPtr.Zero; i++) { Thread.Sleep(500); win = Data.AccountWindow(n); }
+                if (win == IntPtr.Zero) { Note("enter not sent, account " + n + " window never appeared"); Report(ui, done, false); return; }
+                Thread.Sleep(6000);
+            }
             try { ui.BeginInvoke((Action)(() => PressEnter(win, ok => done(ok)))); }
             catch { Report(ui, done, false); }
         });
@@ -143,7 +149,7 @@ static class AutoSend
         t.Start();
     }
 
-    static void Note(string line)
+    public static void Note(string line)
     {
         try { System.IO.File.AppendAllText(System.IO.Path.Combine(ClaudeTray.Dir, "handoff.log"), DateTime.Now.ToString("MM-dd HH:mm:ss.ff") + " " + line + Environment.NewLine); } catch { }
     }

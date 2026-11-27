@@ -111,6 +111,16 @@ static class ClaudeTray
             if (args.Length > 5) panel.RenderBar(args[5]);   // and the bar on the taskbar
             return;
         }
+        if (args.Length > 3 && args[0] == "--render-handoff")   // for pictures: draws the hand-off card for one chat from saved data (JSON)
+        {
+            State = (Dictionary<string, object>)new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(File.ReadAllText(args[1]));
+            using (var f = new HandoffPicker(args[3]) { Location = new Point(-5000, -5000) })
+            {
+                f.Show(); Application.DoEvents();
+                using (var b = new Bitmap(f.Width, f.Height)) { f.DrawToBitmap(b, new Rectangle(0, 0, f.Width, f.Height)); b.Save(args[2]); }
+            }
+            return;
+        }
         if (args.Length > 0 && args[0] == "--manage") { Application.Run(new ManageForm()); return; }
 
         bool first;
@@ -609,10 +619,11 @@ static class ClaudeTray
 
     // Enter sometimes lands before the box is ready and nothing is sent. A few seconds after pressing it,
     // look for the new chat; if none started, press Enter again (an empty box ignores an extra Enter).
-    // Two retries, then a note to press it yourself.
+    // Four retries, waiting longer each time (a slow or just-started account), then a note to press it yourself.
+    static readonly int[] SendChecks = { 6000, 5000, 8000, 12000, 15000 };
     static void MakeSureSent(string sid, int n, DateTime since, string toName, int attempt = 0)
     {
-        var t = new System.Windows.Forms.Timer { Interval = attempt == 0 ? 6000 : 5000 };
+        var t = new System.Windows.Forms.Timer { Interval = SendChecks[Math.Min(attempt, SendChecks.Length - 1)] };
         t.Tick += (s, e) =>
         {
             t.Stop(); t.Dispose();
@@ -625,12 +636,14 @@ static class ClaudeTray
                 {
                     panel.BeginInvoke((Action)(() =>
                     {
-                        if (started) { Fetch(); return; }
-                        if (attempt >= 2 || win == IntPtr.Zero)
+                        if (started) { AutoSend.Note("hand-off check " + attempt + ": new chat started"); Fetch(); return; }
+                        if (attempt >= SendChecks.Length - 1 || win == IntPtr.Zero)
                         {
+                            AutoSend.Note("hand-off check " + attempt + ": no new chat; " + (win == IntPtr.Zero ? "account window gone" : "giving up") + ", asked you to press Enter");
                             tray.ShowBalloonTip(8000, "Press Enter to continue", "The hand-off is in the new chat" + (toName != null ? " on " + toName : "") + " but didn't send. Press Enter there.", ToolTipIcon.Info);
                             return;
                         }
+                        AutoSend.Note("hand-off check " + attempt + ": no new chat yet, pressing Enter again");
                         AutoSend.PressEnter(win, ok => MakeSureSent(sid, n, since, toName, attempt + 1));
                     }));
                 }
@@ -1753,19 +1766,20 @@ class Board : DoubleBufferedControl
         {
             var items = ClaudeTray.Arr(a, gr[0]);
             if (items.Length == 0) continue;
+            if (any) h += P(4);
             any = true;
-            h += P(22);
+            h += P(26);
             foreach (Dictionary<string, object> it in items) h += RowHeight(it, gr[0]);
         }
         if (!any) h += P(22);
-        return h + P(6);
+        return h + P(10);
     }
 
     int RowHeight(Dictionary<string, object> it, string key)
     {
         string k = key == "pinned" ? (it["state"] as string ?? "idle") : key;
         if (k == "background") k = "working";
-        return P(k != "working" && it["detail"] != null ? 52 : 38);
+        return P(k != "working" && it["detail"] != null ? 56 : 42);
     }
 
     string AsOf(Dictionary<string, object> a)
@@ -1847,9 +1861,10 @@ class Board : DoubleBufferedControl
         {
             var items = ClaudeTray.Arr(a, gr[0]);
             if (items.Length == 0) continue;
+            if (any) y += P(4);   // a little air between groups
             any = true;
-            TextRenderer.DrawText(g, gr[1] + "  " + items.Length, fLabel, new Point(x, y + P(4)), Ui.Faint, TextFormatFlags.NoPadding);
-            y += P(22);
+            TextRenderer.DrawText(g, gr[1] + "  " + items.Length, fLabel, new Point(x, y + P(8)), Ui.Faint, TextFormatFlags.NoPadding);
+            y += P(26);
             foreach (Dictionary<string, object> it in items) y += DrawRow(g, it, gr[0], x - P(6), y, w + P(12));
         }
         if (!any) TextRenderer.DrawText(g, "No active conversations", fSmall, new Point(x, y + P(2)), Ui.Faint, TextFormatFlags.NoPadding);
@@ -1907,7 +1922,7 @@ class Board : DoubleBufferedControl
         string sid = it.ContainsKey("sessionId") ? it["sessionId"] as string : null;
         // dot: yellow when it's yours to look at, green instead once the chat has written its hand-off note
         Color yours = it.ContainsKey("noteReady") && it["noteReady"] is bool && (bool)it["noteReady"] ? Ui.Ok : Ui.Warn;
-        int dx = x + P(9), dy = y + P(11);
+        int dx = x + P(9), dy = y + P(13);
         var dotR = new RectangleF(dx, dy, P(7), P(7));
         if (realKey == "idle") using (var pen = new Pen(Ui.Faint, 1.5f * owner.S * zoom)) g.DrawEllipse(pen, dotR);
         else if (realKey == "working" && background)
@@ -1934,7 +1949,7 @@ class Board : DoubleBufferedControl
         {
             // Hover buttons, right to left: finish, pin, hand off.
             bool pinned = key == "pinned";
-            int bx = x + w - P(6) - P(24), by = y + P(4);
+            int bx = x + w - P(6) - P(24), by = y + P(6);
             DrawIconBtn(g, new Rectangle(bx, by, P(24), P(24)), "done", () => ClaudeTray.Mark(sid, "finish"));
             bx -= P(27);
             DrawIconBtn(g, new Rectangle(bx, by, P(24), P(24)), pinned ? "unpin" : "pin", () => ClaudeTray.Mark(sid, pinned ? "unpin" : "pin"));
@@ -1948,18 +1963,18 @@ class Board : DoubleBufferedControl
             if (realKey == "working") when = Ui.Dur(Ui.Now() - ClaudeTray.Num(it["since"]));
             else when = Ui.Ago(ClaudeTray.Num(it["lastActivity"]));
             var ws = TextRenderer.MeasureText(g, when, fTiny, Size.Empty, TextFormatFlags.NoPadding);
-            TextRenderer.DrawText(g, when, fTiny, new Point(x + w - P(8) - ws.Width, y + P(9)), Ui.Dim, TextFormatFlags.NoPadding);
-            if (key == "pinned") TextRenderer.DrawText(g, "\uE718", fIconSmall, new Point(x + w - P(8) - ws.Width - P(15), y + P(9)), Ui.Accent, TextFormatFlags.NoPadding);
+            TextRenderer.DrawText(g, when, fTiny, new Point(x + w - P(8) - ws.Width, y + P(11)), Ui.Dim, TextFormatFlags.NoPadding);
+            if (key == "pinned") TextRenderer.DrawText(g, "\uE718", fIconSmall, new Point(x + w - P(8) - ws.Width - P(15), y + P(11)), Ui.Accent, TextFormatFlags.NoPadding);
         }
 
         var flags = TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine;
-        int ty = y + P(5);
+        int ty = y + P(7);
         TextRenderer.DrawText(g, (string)it["title"], realKey == "unseen" ? fTitleBold : fTitle, new Rectangle(tx, ty, tw, P(18)), Ui.Text, flags);
         ty += P(18);
         if (realKey != "working" && it["detail"] != null)
         {
             TextRenderer.DrawText(g, (string)it["detail"], fSmall, new Rectangle(tx, ty, detailW, P(15)), Ui.Dim, flags);
-            ty += P(15);
+            ty += P(16);
         }
         var meta = new List<string>();
         if (it["folder"] != null) meta.Add((string)it["folder"]);
@@ -1979,7 +1994,7 @@ class Board : DoubleBufferedControl
             mx += TextRenderer.MeasureText(g, ctxText, fTiny, Size.Empty, TextFormatFlags.NoPadding).Width;
             if (meta.Count > 0) { TextRenderer.DrawText(g, " · ", fTiny, new Point(mx, ty), Ui.Faint, TextFormatFlags.NoPadding); mx += TextRenderer.MeasureText(g, " · ", fTiny, Size.Empty, TextFormatFlags.NoPadding).Width; }
         }
-        TextRenderer.DrawText(g, string.Join(" · ", meta), fTiny, new Rectangle(mx, ty, Math.Max(0, tx + (showBtns && ty < y + P(30) ? tw : tw + P(48)) - mx), P(14)), Ui.Faint, flags);
+        TextRenderer.DrawText(g, string.Join(" · ", meta), fTiny, new Rectangle(mx, ty, Math.Max(0, tx + (showBtns && ty < y + P(32) ? tw : tw + P(48)) - mx), P(14)), Ui.Faint, flags);
         return h;
     }
 }

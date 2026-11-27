@@ -234,6 +234,23 @@ class ManageForm : Form
         list.Controls.Clear();
         foreach (var a in Accounts.All()) list.Controls.Add(MakeRow(a));
         list.ResumeLayout();
+        FitList();
+    }
+
+    // The account list is only as tall as its rows (up to five, then it scrolls), and the settings below move up to meet it.
+    void FitList()
+    {
+        int want = P(4);
+        foreach (Control c in list.Controls) want += c.Height + c.Margin.Vertical;
+        want = Math.Min(want, P(348));
+        int delta = want - list.Height;
+        if (delta == 0) return;
+        int bottom = list.Bottom;
+        SuspendLayout();
+        list.Height = want;
+        foreach (Control c in Controls) if (c != list && c.Top >= bottom) c.Top += delta;
+        ClientSize = new Size(ClientSize.Width, ClientSize.Height + delta);
+        ResumeLayout();
     }
 
     // Long jobs (building a launcher) run off this window's thread.

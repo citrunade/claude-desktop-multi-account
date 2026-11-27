@@ -84,7 +84,9 @@ async function checkRequest($: EngineInterface) {
     if (r.why === 'quiet') why = 'quiet'
   } catch { return }
   const now = await $.clock.now()
-  if (!at || now - at > REQUEST_MAX_AGE_MS) return
+  // A quiet-chat request is only worth it before Claude's hour of memory runs out: the tracker asks at
+  // 55 minutes, so one picked up late (the chat was asleep) is dropped rather than waking it at full price.
+  if (!at || now - at > (why === 'quiet' ? 2 * 60 * 1000 : REQUEST_MAX_AGE_MS)) return
   const st = await readStage($, id)
   if (st?.requested === at) return
   // A window name of its own, so the 5-hour stop can still ask for a fresh note later in this window.
