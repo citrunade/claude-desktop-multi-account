@@ -1,6 +1,6 @@
 # Claude Desktop: log into multiple accounts at once
 
-**See every account's usage and active conversations in one small taskbar widget.**
+Use two or more Claude accounts side by side on Windows, without signing out and back in to switch accounts. **See every account's usage limits and active conversations in one small taskbar widget**, and when a chat hits its usage limit, carry it on in another account.
 
 Bonus: track each conversation's context, pin conversations, open any conversation in one click, start new ones on any account, hand a conversation to another account automatically when it hits its limit, and give each account its own icon.
 
