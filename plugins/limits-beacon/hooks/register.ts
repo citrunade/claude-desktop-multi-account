@@ -28,6 +28,8 @@ const MAX_REFUSALS = 4
 
 type Stage = {
   window: string; stage: 'asked' | 'written' | 'gave-up'; turnId?: string; refusals?: number; at: number
+  // Why the note was asked for: the 5-hour line, the hand-off button, or a quiet chat. Old files have none.
+  why?: 'limit' | 'move' | 'quiet'
   // A button request: its time, and true until the turn it starts has begun.
   requested?: number; pending?: boolean
 }
@@ -61,6 +63,15 @@ const asked = (path: string, why: string) =>
   `You may read files to get this right, but other tools are held until the note is saved. ` +
   `After saving it, reply with one line saying the note is saved and stop.`
 
+// The reason given when a tool is held. Only the 5-hour stop mentions the limit; a request from the
+// tracker (window named 'request-...') never does, even in files written before 'why' was saved.
+const heldWhy = (st: Stage) => {
+  const why = st.why ?? (st.window.startsWith('request-') ? 'move' : 'limit')
+  return why === 'limit' ? 'the 5-hour limit is nearly used up.'
+    : why === 'quiet' ? 'this chat has been quiet for almost an hour, so it is writing its hand-off note while that is still cheap.'
+    : 'this chat is being moved to another account.'
+}
+
 const stageFile = (id: string) => NOTES + id + '.state.json'
 const requestFile = (id: string) => NOTES + id + '.request.json'
 const notePath = (id: string) => NOTES + id + '.md'
@@ -90,7 +101,7 @@ async function checkRequest($: EngineInterface) {
   const st = await readStage($, id)
   if (st?.requested === at) return
   // A window name of its own, so the 5-hour stop can still ask for a fresh note later in this window.
-  await writeStage($, id, { window: 'request-' + at, stage: 'asked', refusals: 0, at: now, requested: at, pending: true })
+  await writeStage($, id, { window: 'request-' + at, stage: 'asked', refusals: 0, at: now, requested: at, pending: true, why: why as 'move' | 'quiet' })
   await $.prompt.submit({ text: asked(notePath(id), why) })
 }
 
@@ -160,7 +171,7 @@ export const register: Register = (on) => {
       const st = await readStage($, id)
       if (!st || st.window !== d.window) {
         const r = await next(e)
-        await writeStage($, id, { window: d.window, stage: 'asked', turnId: mainTurn, refusals: 0, at: await $.clock.now() })
+        await writeStage($, id, { window: d.window, stage: 'asked', turnId: mainTurn, refusals: 0, at: await $.clock.now(), why: 'limit' })
         try { $.ui.toast(`5-hour limit at ${d.pct}%: Claude is writing a hand-off note, then stopping.`) } catch { }
         const say = instruction(notePath(id), d.pct)
         if (r.deny !== undefined) return { deny: r.deny + '\n\n' + say }
@@ -192,7 +203,7 @@ export const register: Register = (on) => {
         return next(e)
       }
       await writeStage($, id, { ...st, refusals })
-      return { deny: `Held: the 5-hour limit is nearly used up. Write the hand-off note to ${notePath(id)} with the Write tool first, then stop.` }
+      return { deny: `Held: ${heldWhy(st)} Write the hand-off note to ${notePath(id)} with the Write tool first, then stop.` }
     }
 
     // 3. Note saved but Claude reached for another tool in the same turn: end the turn.
