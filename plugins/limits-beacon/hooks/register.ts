@@ -1,4 +1,4 @@
-﻿import type { Register, EngineInterface } from 'claude-code'
+import type { Register, EngineInterface } from 'claude-code'
 
 // Saves the limit numbers each Claude reply already carries, one file per conversation,
 // for the Claude Code tracker (which works out each conversation's account).

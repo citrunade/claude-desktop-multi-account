@@ -129,6 +129,7 @@ static class ClaudeTray
         {
             // Running it again (for example from a shortcut) opens the running one's panel.
             if (!first) { showSignal.Set(); return; }
+            try { Accounts.FixPluginFolder(); } catch { }
 
             tray = new NotifyIcon();
             tray.Text = "Claude Tracker";
@@ -172,6 +173,7 @@ static class ClaudeTray
     }
 
     // ---------- data ----------
+    static DateTime pluginChecked = DateTime.UtcNow;
     public static void Fetch()
     {
         if (fetching) return;
@@ -180,6 +182,11 @@ static class ClaudeTray
         {
             Dictionary<string, object> d = null;
             string err = null;
+            if ((DateTime.UtcNow - pluginChecked).TotalSeconds > 60)
+            {
+                pluginChecked = DateTime.UtcNow;
+                try { Accounts.FixPluginFolder(); } catch { }
+            }
             try { d = Data.State(); }
             catch (Exception e) { err = e.Message; }
             try

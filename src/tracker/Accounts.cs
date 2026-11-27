@@ -598,11 +598,7 @@ static class Accounts
         var plugins = Path.Combine(TrackerDir, "plugins");
         var reg = Path.Combine(plugins, @"limits-beacon\hooks\register.ts");
         if (!File.Exists(reg)) return;
-        var dirForTs = Data.BySessionDir.Replace('\\', '/') + "/";
-        var ts = File.ReadAllText(reg);
-        ts = Regex.Replace(ts, "const DIR = '[^']*'", "const DIR = '" + dirForTs + "'");
-        File.WriteAllText(reg, ts);
-        Directory.CreateDirectory(Data.BySessionDir);
+        FixPluginFolder();
         WriteNoteSettings(Load());
 
         var settingsPath = ClaudeSettingsPath();
@@ -622,6 +618,24 @@ static class Accounts
         Directory.CreateDirectory(Path.GetDirectoryName(settingsPath));
         if (File.Exists(settingsPath)) File.Copy(settingsPath, settingsPath + ".before-claude-tracker", true);
         File.WriteAllText(settingsPath, Pretty(js.Serialize(s)));
+    }
+
+    // The plugin ships with a placeholder folder (C:/Users/YOU/...). If it's left in, every new chat writes
+    // its limit numbers and looks for hand-off requests in a folder that doesn't exist: the panel's numbers
+    // stop updating and the hand-off button waits for a note that is never asked for. Copying the plugin
+    // over by hand brings the placeholder back, so the tracker puts the real folder in whenever it starts.
+    // Returns true when it had to change the file.
+    public static bool FixPluginFolder()
+    {
+        var reg = Path.Combine(TrackerDir, @"plugins\limits-beacon\hooks\register.ts");
+        if (!File.Exists(reg)) return false;
+        Directory.CreateDirectory(Data.BySessionDir);
+        var dirForTs = Data.BySessionDir.Replace('\\', '/') + "/";
+        var ts = File.ReadAllText(reg);
+        var fixedTs = Regex.Replace(ts, "const DIR = '[^']*'", "const DIR = '" + dirForTs + "'");
+        if (fixedTs == ts) return false;
+        File.WriteAllText(reg, fixedTs);
+        return true;
     }
 
     // Undo RegisterLimitsPlugin (used by the uninstaller).
