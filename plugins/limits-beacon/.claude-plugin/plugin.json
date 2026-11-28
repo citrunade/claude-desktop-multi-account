@@ -1,1 +1,1 @@
-{ "name": "limits-beacon", "version": "0.5.2", "description": "Saves the plan limit numbers each Claude reply carries, per account, for the Claude Code tracker, and near the 5-hour limit asks the chat to write a short hand-off note and stop. Makes no model calls." }
+{ "name": "limits-beacon", "version": "0.5.3", "description": "Saves the plan limit numbers each Claude reply carries, per account, for the Claude Code tracker, and near the 5-hour limit asks the chat to write a short hand-off note and stop. Makes no model calls." }
