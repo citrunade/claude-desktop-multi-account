@@ -261,8 +261,9 @@ static class ClaudeTray
         tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
 
         double now = Num(d["now"]);
+        lastData = d;
 
-        Hint = SuggestAccount(d, now);
+        Hint =SuggestAccount(d, now);
         AutoHandoff(d, now);
         NoteBeforeForgotten(d, now);
         KeepClock(d, now);
@@ -371,6 +372,7 @@ static class ClaudeTray
                 bool opened = false;
                 try { opened = Data.StartConversation(nn, KeepClockText); } catch { }
                 if (!opened) { clockBusy = false; ClockNote("account " + nn, "couldn't open a new chat"); return; }
+                NoteNewChat(nn);
                 AutoSend.Run(nn, panel, sent =>
                 {
                     clockBusy = false;
@@ -569,6 +571,35 @@ static class ClaudeTray
         timer.Start();
     }
 
+    // Whether account n's window may be showing a chat that is still working, where the Escape the
+    // hand-off presses would stop it: a working chat is the one shown there, or the tracker opened a
+    // chat there in the last few minutes (it's in front and most likely still replying; the shown-chat
+    // reading lags behind a brand-new chat).
+    static Dictionary<string, object> lastData;
+    static readonly Dictionary<int, DateTime> newChatAt = new Dictionary<int, DateTime>();
+    static void NoteNewChat(int n) { lock (newChatAt) newChatAt[n] = DateTime.UtcNow; }
+    static bool WindowMayBeBusy(int n)
+    {
+        DateTime at;
+        lock (newChatAt) if (newChatAt.TryGetValue(n, out at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(5)) return true;
+        var d = lastData;
+        if (d == null) return false;
+        var on = Data.OnScreen;
+        foreach (Dictionary<string, object> a in Arr(d, "accounts"))
+        {
+            if (Convert.ToInt32(a["n"]) != n) continue;
+            foreach (var cat in new[] { "working", "pinned" })
+                foreach (Dictionary<string, object> it in Arr(a, cat))
+                {
+                    var s = it["sessionId"] as string;
+                    string state = it["state"] as string;
+                    bool working = cat == "working" || state == "working" || state == "background";
+                    if (working && s != null && on.Contains(s)) return true;
+                }
+        }
+        return false;
+    }
+
     public static void Handoff(string sid, int n, bool send = false, string doneTitle = null, bool fallback = false)
     {
         string cwd;
@@ -599,11 +630,12 @@ static class ClaudeTray
                 if (!ok) Handoff(sid, n, send, doneTitle, true);
                 else
                 {
+                    NoteNewChat(n);
                     try { Clipboard.SetText(moved); } catch { }   // backup, as on the other path
                     if (send) MakeSureSent(sid, n, sentAt, doneTitle);
                 }
                 Fetch();
-            });
+            }, WindowMayBeBusy(n));
             return;
         }
         bool askTrust = folder != null;
@@ -612,6 +644,7 @@ static class ClaudeTray
         Act(() =>
         {
             bool ok = Data.StartConversation(n, text, folder);
+            if (ok) NoteNewChat(n);
             if (ok && askTrust)
                 try { panel.BeginInvoke((Action)(() => tray.ShowBalloonTip(10000, "Trust the folder, then press Enter", "Claude asks you to trust " + folder + " for the new chat (it always does for a chat opened from outside the app). Click Trust workspace, then press Enter to send the hand-off. The old chat stays in the panel until the new one starts.", ToolTipIcon.Info))); } catch { }
             if (ok && send)

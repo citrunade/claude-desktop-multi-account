@@ -32,10 +32,21 @@ static class AutoSend
     // window forward (starting the account if it isn't open), presses Ctrl+Shift+N (new chat with the
     // current settings), pastes the hand-off over anything left in the box and, with send, presses Enter.
     // done(false) when it couldn't get the window in front; nothing was typed then.
-    public static void NewChatAndPaste(int n, Control ui, string text, bool send, Action<bool> done)
+    // busy: the window may be showing a chat that is still working (one you're running there, or the
+    // chat the previous hand-off just started). Escape would stop it, so a blank new chat is opened in
+    // that window first and the keys land there instead.
+    public static void NewChatAndPaste(int n, Control ui, string text, bool send, Action<bool> done, bool busy = false)
     {
         ThreadPool.QueueUserWorkItem(_ =>
         {
+            if (busy)
+            {
+                bool opened = false;
+                try { opened = Data.StartConversation(n); } catch { }
+                Note("window may show a working chat; " + (opened ? "opened a blank new chat first" : "couldn't open a blank chat first, not sending keys"));
+                if (!opened) { Report(ui, done, false); return; }
+                Thread.Sleep(2500);   // let the blank chat page load before Escape
+            }
             IntPtr win = Data.AccountWindow(n);
             if (win == IntPtr.Zero)
             {

@@ -25,6 +25,11 @@ const LOOKING = new Set(['Read', 'Grep', 'Glob', 'LS', 'TodoWrite', 'TaskList', 
 const REQUEST_MAX_AGE_MS = 5 * 60 * 1000
 // If Claude keeps reaching for other tools, stop holding it back after this many refusals.
 const MAX_REFUSALS = 4
+// A note asked for or written this recently counts for the 5-hour stop too: it isn't asked for again.
+const RECENT_NOTE_MS = 15 * 60 * 1000
+// Requests already sent to a chat (session id + request time). The stage file alone can't say, since
+// the 5-hour stop rewrites it; without this the same request was sent again every few seconds.
+const handled = new Set<string>()
 
 type Stage = {
   window: string; stage: 'asked' | 'written' | 'gave-up'; turnId?: string; refusals?: number; at: number
@@ -98,8 +103,11 @@ async function checkRequest($: EngineInterface) {
   // A quiet-chat request is only worth it before Claude's hour of memory runs out: the tracker asks at
   // 55 minutes, so one picked up late (the chat was asleep) is dropped rather than waking it at full price.
   if (!at || now - at > (why === 'quiet' ? 2 * 60 * 1000 : REQUEST_MAX_AGE_MS)) return
+  const key = id + '|' + at
+  if (handled.has(key)) return
   const st = await readStage($, id)
-  if (st?.requested === at) return
+  if (st?.requested === at) { handled.add(key); return }
+  handled.add(key)
   // A window name of its own, so the 5-hour stop can still ask for a fresh note later in this window.
   await writeStage($, id, { window: 'request-' + at, stage: 'asked', refusals: 0, at: now, requested: at, pending: true, why: why as 'move' | 'quiet' })
   await $.prompt.submit({ text: asked(notePath(id), why) })
@@ -154,7 +162,14 @@ export const register: Register = (on) => {
       if (five && s.enabled && five.percentUsed >= s.percent) {
         const window = five.resetsAt ?? 'unknown'
         const st = await readStage($, id)
-        due = st && st.window === window ? undefined : { window, pct: Math.floor(five.percentUsed) }
+        if (st && st.window === window) due = undefined
+        else if (st && st.stage !== 'gave-up' && (await $.clock.now()) - st.at < RECENT_NOTE_MS) {
+          // A note was just asked for or written (the hand-off button, or a quiet chat): that one counts
+          // for this 5-hour window, instead of asking again on top of it.
+          due = undefined
+          await writeStage($, id, { ...st, window })
+        }
+        else due = { window, pct: Math.floor(five.percentUsed) }
       } else due = undefined
     } catch { /* never get in the way of the session */ }
     return r
@@ -171,7 +186,8 @@ export const register: Register = (on) => {
       const st = await readStage($, id)
       if (!st || st.window !== d.window) {
         const r = await next(e)
-        await writeStage($, id, { window: d.window, stage: 'asked', turnId: mainTurn, refusals: 0, at: await $.clock.now(), why: 'limit' })
+        // Keeps the last request's time, so that request isn't taken for a new one and sent again.
+        await writeStage($, id, { window: d.window, stage: 'asked', turnId: mainTurn, refusals: 0, at: await $.clock.now(), why: 'limit', requested: st?.requested })
         try { $.ui.toast(`5-hour limit at ${d.pct}%: Claude is writing a hand-off note, then stopping.`) } catch { }
         const say = instruction(notePath(id), d.pct)
         if (r.deny !== undefined) return { deny: r.deny + '\n\n' + say }
